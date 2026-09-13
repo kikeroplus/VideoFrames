@@ -180,6 +180,12 @@ class PlayerPanel(QWidget):
         self._in_text_label = QLabel("IN: -")
         self._out_text_label = QLabel("OUT: -")
 
+        self._preview_button = QPushButton("▶ IN-OUT再生")
+        self._preview_button.setEnabled(False)
+        self._preview_button.clicked.connect(self.toggle_preview_in_out)
+        self._previewing = False
+        self._preview_watcher = None
+
         controls_row = QHBoxLayout()
         controls_row.addWidget(self._back10_button)
         controls_row.addWidget(self._back1_button)
@@ -202,6 +208,9 @@ class PlayerPanel(QWidget):
         in_col.addWidget(self._in_button)
         in_out_row.addLayout(in_col)
         in_out_row.setAlignment(in_col, Qt.AlignmentFlag.AlignBottom)
+        in_out_row.addStretch(1)
+        in_out_row.addWidget(self._preview_button)
+        in_out_row.setAlignment(self._preview_button, Qt.AlignmentFlag.AlignBottom)
         in_out_row.addStretch(1)
         in_out_row.addWidget(self._out_thumb_label)
         in_out_row.setAlignment(self._out_thumb_label, Qt.AlignmentFlag.AlignBottom)
@@ -233,6 +242,7 @@ class PlayerPanel(QWidget):
     # ------------------------------------------------------------- 読み込み
 
     def load_video(self, item: VideoItem) -> None:
+        self._cancel_preview_watch()
         self._item = item
         self._in_point_s = None
         self._out_point_s = None
@@ -259,6 +269,7 @@ class PlayerPanel(QWidget):
         self._update_time_label(0.0)
 
     def show_loading(self, path: Path) -> None:
+        self._cancel_preview_watch()
         self._item = None
         self._pending_prime = False
         self._player.stop()
@@ -268,6 +279,7 @@ class PlayerPanel(QWidget):
         self._reset_keyframe_display()
 
     def show_error(self, path: Path, message: str) -> None:
+        self._cancel_preview_watch()
         self._item = None
         self._pending_prime = False
         self._player.stop()
@@ -277,6 +289,7 @@ class PlayerPanel(QWidget):
         self._reset_keyframe_display()
 
     def clear(self) -> None:
+        self._cancel_preview_watch()
         self._item = None
         self._pending_prime = False
         self._player.stop()
@@ -297,6 +310,7 @@ class PlayerPanel(QWidget):
     def toggle_play_pause(self) -> None:
         if self._item is None:
             return
+        self._cancel_preview_watch()
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
         else:
@@ -305,6 +319,7 @@ class PlayerPanel(QWidget):
     def step_frame(self, delta: int) -> None:
         if self._item is None or self._item.fps <= 0:
             return
+        self._cancel_preview_watch()
         self._priming_active = False
         self._player.pause()
         frame_ms = 1000.0 / self._item.fps
@@ -314,6 +329,7 @@ class PlayerPanel(QWidget):
     def step_seconds(self, delta: float) -> None:
         if self._item is None:
             return
+        self._cancel_preview_watch()
         self._priming_active = False
         new_ms = max(0, round(self._player.position() + delta * 1000))
         self._player.setPosition(new_ms)
@@ -333,6 +349,7 @@ class PlayerPanel(QWidget):
         """
         if self._item is None:
             return
+        self._cancel_preview_watch()
         self._priming_active = False
         self._in_point_s = max(0.0, min(seconds, self._item.duration))
         self._update_in_out_label()
@@ -406,6 +423,7 @@ class PlayerPanel(QWidget):
             return
         target = prev_keyframe(self.current_position_seconds(), self._keyframes)
         if target is not None:
+            self._cancel_preview_watch()
             self._priming_active = False
             self._player.pause()
             self._player.setPosition(round(target * 1000))
@@ -415,17 +433,60 @@ class PlayerPanel(QWidget):
             return
         target = next_keyframe(self.current_position_seconds(), self._keyframes)
         if target is not None:
+            self._cancel_preview_watch()
             self._priming_active = False
             self._player.pause()
             self._player.setPosition(round(target * 1000))
 
     def _seek_to_marked_point(self, seconds: float | None) -> None:
         """IN/OUTサムネイルクリック時、その位置へ再生ヘッドを移動する。"""
+        self._cancel_preview_watch()
         if self._item is None or seconds is None:
             return
         self._priming_active = False
         self._player.pause()
         self._player.setPosition(round(seconds * 1000))
+
+    def toggle_preview_in_out(self) -> None:
+        """IN点からOUT点までを再生し、OUT点で自動的に一時停止する。"""
+        if self._previewing:
+            self._stop_preview()
+            return
+        if self._item is None or self._in_point_s is None or self._out_point_s is None:
+            return
+        if self._out_point_s <= self._in_point_s:
+            return
+
+        self._priming_active = False
+        self._player.setPosition(round(self._in_point_s * 1000))
+        self._player.play()
+
+        out_ms = round(self._out_point_s * 1000)
+        self._previewing = True
+        self._preview_button.setText("■ プレビュー停止")
+
+        def watcher(position_ms: int) -> None:
+            if self._previewing and position_ms >= out_ms:
+                self._stop_preview()
+
+        self._preview_watcher = watcher
+        self._player.positionChanged.connect(watcher)
+
+    def _stop_preview(self) -> None:
+        self._cancel_preview_watch()
+        self._player.pause()
+
+    def _cancel_preview_watch(self) -> None:
+        if not self._previewing:
+            return
+        self._previewing = False
+        self._preview_button.setText("▶ IN-OUT再生")
+        if self._preview_watcher is not None:
+            try:
+                self._player.positionChanged.disconnect(self._preview_watcher)
+            except (RuntimeError, TypeError):
+                pass
+            self._preview_watcher = None
 
     # -------------------------------------------------------------- 内部
 
@@ -460,12 +521,24 @@ class PlayerPanel(QWidget):
             self._in_button, self._out_button,
         ):
             widget.setEnabled(enabled)
+        if not enabled:
+            # プレビューボタンは IN/OUT が両方揃った時だけ有効化する
+            # (_update_in_out_label 側で管理)。無効化のみここで反映する。
+            self._preview_button.setEnabled(False)
 
     def _update_in_out_label(self) -> None:
         in_text = seconds_to_timecode(self._in_point_s) if self._in_point_s is not None else "-"
         out_text = seconds_to_timecode(self._out_point_s) if self._out_point_s is not None else "-"
         self._in_text_label.setText(f"IN: {in_text}")
         self._out_text_label.setText(f"OUT: {out_text}")
+        valid_range = (
+            self._in_point_s is not None
+            and self._out_point_s is not None
+            and self._out_point_s > self._in_point_s
+        )
+        self._preview_button.setEnabled(valid_range)
+        if not valid_range:
+            self._cancel_preview_watch()
 
     def _update_time_label(self, position_s: float) -> None:
         fps = self._item.fps if self._item else 0.0
@@ -527,6 +600,7 @@ class PlayerPanel(QWidget):
         self._seeking_by_user = True
 
     def _on_slider_moved(self, position_ms: int) -> None:
+        self._cancel_preview_watch()
         self._priming_active = False
         self._player.setPosition(position_ms)
 
