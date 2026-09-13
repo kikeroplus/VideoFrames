@@ -47,6 +47,21 @@ class KeyframeSlider(QSlider):
     def __init__(self, parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
         self._keyframe_positions_ms: list[int] = []
+        # 既定のノブが細く見づらいため、太い縁取り付きの円で強調する
+        self.setStyleSheet(
+            """
+            QSlider::groove:horizontal { height: 4px; background: palette(mid); border-radius: 2px; }
+            QSlider::sub-page:horizontal { background: palette(highlight); border-radius: 2px; }
+            QSlider::handle:horizontal {
+                background: palette(base);
+                border: 2px solid palette(highlight);
+                width: 16px;
+                height: 16px;
+                margin: -7px 0;
+                border-radius: 9px;
+            }
+            """
+        )
 
     def set_keyframes(self, keyframes_s: list[float]) -> None:
         self._keyframe_positions_ms = [round(k * 1000) for k in keyframes_s]
@@ -78,6 +93,21 @@ class KeyframeSlider(QSlider):
             )
             painter.drawLine(x, groove_rect.y(), x, groove_rect.y() + groove_rect.height())
         painter.end()
+
+
+class ClickableThumbLabel(QLabel):
+    """クリックでシグナルを発行するサムネイル表示用ラベル。"""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 class PlayerPanel(QWidget):
@@ -145,6 +175,8 @@ class PlayerPanel(QWidget):
 
         self._in_thumb_label = self._make_thumb_label()
         self._out_thumb_label = self._make_thumb_label()
+        self._in_thumb_label.clicked.connect(lambda: self._seek_to_marked_point(self._in_point_s))
+        self._out_thumb_label.clicked.connect(lambda: self._seek_to_marked_point(self._out_point_s))
         self._in_text_label = QLabel("IN: -")
         self._out_text_label = QLabel("OUT: -")
 
@@ -387,13 +419,22 @@ class PlayerPanel(QWidget):
             self._player.pause()
             self._player.setPosition(round(target * 1000))
 
+    def _seek_to_marked_point(self, seconds: float | None) -> None:
+        """IN/OUTサムネイルクリック時、その位置へ再生ヘッドを移動する。"""
+        if self._item is None or seconds is None:
+            return
+        self._priming_active = False
+        self._player.pause()
+        self._player.setPosition(round(seconds * 1000))
+
     # -------------------------------------------------------------- 内部
 
-    def _make_thumb_label(self) -> QLabel:
-        label = QLabel()
+    def _make_thumb_label(self) -> ClickableThumbLabel:
+        label = ClickableThumbLabel()
         label.setFixedSize(*IN_OUT_THUMB_SIZE)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("background: palette(dark); border: 1px solid palette(mid);")
+        label.setToolTip("クリックでこの位置に移動")
         return label
 
     def _set_thumb(self, label: QLabel) -> None:
