@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QThreadPool, Qt
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -40,7 +40,7 @@ from app.ui.player_panel import PlayerPanel
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.thumbnail_grid import THUMB_SIZES, ThumbnailGrid
 from app.ui.toast import Toast
-from app.utils.paths import next_output_path
+from app.utils.paths import next_output_path, resource_path
 from app.utils.timecode import seconds_to_timecode
 
 MAX_PARALLEL_LOADS = 4
@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VideoTrimmer")
+        self.setWindowIcon(QIcon(str(resource_path("assets/icon.ico"))))
         self.resize(1100, 700)
 
         self._settings = make_settings()

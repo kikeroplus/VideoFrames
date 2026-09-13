@@ -3,7 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
+
+# app/utils/paths.py から見てプロジェクトルート（VideoTrimmer/ 相当）
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def resource_path(relative: str) -> Path:
+    """アイコン等の同梱リソースへのパスを解決する。
+
+    開発時はプロジェクトルート基準、PyInstaller でパッケージ化された
+    実行ファイルでは展開先(sys._MEIPASS)基準になる。
+    """
+    base = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT))
+    return base / relative
 
 
 def cache_key_for(path: Path) -> str:

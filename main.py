@@ -15,11 +15,14 @@ from app.core.probe import ProbeError, probe_video
 
 
 def run_gui() -> int:
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
     from app.ui.main_window import MainWindow
+    from app.utils.paths import resource_path
 
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(resource_path("assets/icon.ico"))))
     window = MainWindow()
     window.show()
     return app.exec()
