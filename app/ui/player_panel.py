@@ -89,6 +89,9 @@ class PlayerPanel(QWidget):
 
         self._in_button = QPushButton("IN設定")
         self._out_button = QPushButton("OUT設定")
+        for button in (self._in_button, self._out_button):
+            button.setMinimumHeight(44)
+            button.setStyleSheet("font-size: 14pt; font-weight: bold;")
         self._in_button.clicked.connect(self.set_in_point)
         self._out_button.clicked.connect(self.set_out_point)
 
