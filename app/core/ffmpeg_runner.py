@@ -106,8 +106,7 @@ def _run_ffmpeg(
         elif sep and _is_progress_key(key):
             continue  # frame=/fps=/bitrate= など他の進捗フィールドはログに含めない
         else:
-            log_lines.append(line)
-            del log_lines[:-20]  # 末尾20行だけ保持(§11)
+            log_lines.append(line)  # 全量を保持する。末尾20行への切り詰めは表示側(§11)で行う
 
     if is_cancelled():
         try:

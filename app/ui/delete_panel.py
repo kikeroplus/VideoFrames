@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.app_settings import KEY_DELETE_CUT_MODE, make_settings
 from app.core.edit_ops import (
     CutMode,
     DeleteMode,
@@ -57,8 +58,21 @@ class DeletePanel(QWidget):
         self._middle_end: float | None = None
 
         self._build_ui()
+        self._restore_cut_mode()
         self._connect_signals()
         self._on_video_changed()
+
+    def _restore_cut_mode(self) -> None:
+        settings = make_settings()
+        mode = settings.value(KEY_DELETE_CUT_MODE, "auto", str)
+        {
+            "auto": self._cut_auto_radio,
+            "copy_priority": self._cut_copy_priority_radio,
+            "always_encode": self._cut_always_encode_radio,
+        }.get(mode, self._cut_auto_radio).setChecked(True)
+
+    def _save_cut_mode(self) -> None:
+        make_settings().setValue(KEY_DELETE_CUT_MODE, self._get_cut_mode())
 
     # ------------------------------------------------------------------ UI
 
@@ -193,6 +207,7 @@ class DeletePanel(QWidget):
 
         for rb in (self._cut_auto_radio, self._cut_copy_priority_radio, self._cut_always_encode_radio):
             rb.toggled.connect(self._revalidate)
+            rb.toggled.connect(lambda checked: self._save_cut_mode() if checked else None)
 
         self._snap_prev_button.clicked.connect(lambda: self._apply_snap(prev_keyframe))
         self._snap_next_button.clicked.connect(lambda: self._apply_snap(next_keyframe))

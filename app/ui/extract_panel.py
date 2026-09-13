@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.app_settings import KEY_EXTRACT_CUT_MODE, make_settings
 from app.core.edit_ops import CutDecision, CutMode, decide_cut_strategy, format_cut_status
 from app.core.keyframes import next_keyframe, prev_keyframe
 from app.ui.player_panel import PlayerPanel
@@ -45,8 +46,21 @@ class ExtractPanel(QWidget):
         self._pending_request: ExtractRequest | None = None
 
         self._build_ui()
+        self._restore_cut_mode()
         self._connect_signals()
         self._revalidate()
+
+    def _restore_cut_mode(self) -> None:
+        settings = make_settings()
+        mode = settings.value(KEY_EXTRACT_CUT_MODE, "auto", str)
+        {
+            "auto": self._cut_auto_radio,
+            "copy_priority": self._cut_copy_priority_radio,
+            "always_encode": self._cut_always_encode_radio,
+        }.get(mode, self._cut_auto_radio).setChecked(True)
+
+    def _save_cut_mode(self) -> None:
+        make_settings().setValue(KEY_EXTRACT_CUT_MODE, self._get_cut_mode())
 
     # ------------------------------------------------------------------ UI
 
@@ -178,6 +192,7 @@ class ExtractPanel(QWidget):
         self._exclude_audio_checkbox.toggled.connect(self._revalidate)
         for rb in (self._cut_auto_radio, self._cut_copy_priority_radio, self._cut_always_encode_radio):
             rb.toggled.connect(self._revalidate)
+            rb.toggled.connect(lambda checked: self._save_cut_mode() if checked else None)
 
         self._snap_prev_button.clicked.connect(self._on_snap_prev)
         self._snap_next_button.clicked.connect(self._on_snap_next)

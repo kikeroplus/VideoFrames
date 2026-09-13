@@ -14,11 +14,15 @@ from app.core.thumbnail import get_or_create_thumbnail
 SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".m4v", ".ts", ".webm"}
 
 
-def scan_folder(folder: Path) -> list[Path]:
-    """フォルダ直下の対応拡張子の動画ファイル一覧を返す（サブフォルダは走査しない）。"""
+def scan_folder(folder: Path, extensions: set[str] | None = None) -> list[Path]:
+    """フォルダ直下の対応拡張子の動画ファイル一覧を返す（サブフォルダは走査しない）。
+
+    extensions を省略した場合は既定の対応拡張子(SUPPORTED_EXTENSIONS)を使う。
+    """
+    exts = extensions if extensions is not None else SUPPORTED_EXTENSIONS
     return sorted(
         p for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        if p.is_file() and p.suffix.lower() in exts
     )
 
 

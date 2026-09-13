@@ -1,12 +1,14 @@
-"""メインウィンドウ。Phase 3: フォルダ選択 + サムネ一覧 + プレビュー再生 + 抜き出し。"""
+"""メインウィンドウ。Phase 5: フォルダ選択 + 一覧 + プレビュー + 抜き出し/削除 + 設定。"""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QThreadPool, Qt
+from PySide6.QtCore import QThreadPool, Qt
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.app_settings import KEY_LAST_FOLDER, KEY_THUMB_SIZE, load_app_settings, make_settings, save_app_settings
 from app.core.edit_ops import build_cut_cmd
 from app.core.ffmpeg_runner import DeleteMiddleJob, FFmpegJob, find_ffmpeg, find_ffprobe
 from app.core.keyframes import KeyframeWorker
@@ -34,14 +37,14 @@ from app.core.video_loader import LoadVideoWorker, scan_folder
 from app.ui.delete_panel import DeletePanel, DeleteRequest
 from app.ui.extract_panel import ExtractPanel, ExtractRequest
 from app.ui.player_panel import PlayerPanel
+from app.ui.settings_dialog import SettingsDialog
 from app.ui.thumbnail_grid import THUMB_SIZES, ThumbnailGrid
+from app.ui.toast import Toast
 from app.utils.paths import next_output_path
 from app.utils.timecode import seconds_to_timecode
 
-ORG_NAME = "VideoTrimmer"
-APP_NAME = "VideoTrimmer"
-SETTINGS_LAST_FOLDER = "last_folder"
 MAX_PARALLEL_LOADS = 4
+LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / "VideoTrimmer" / "logs"
 
 
 class MainWindow(QMainWindow):
@@ -50,7 +53,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("VideoTrimmer")
         self.resize(1100, 700)
 
-        self._settings = QSettings(ORG_NAME, APP_NAME)
+        self._settings = make_settings()
+        self._app_settings = load_app_settings(self._settings)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(MAX_PARALLEL_LOADS)
         self._job_pool = QThreadPool(self)
@@ -59,9 +63,9 @@ class MainWindow(QMainWindow):
         self._job_start_time: float = 0.0
         self._generation = 0
         self._current_folder: Path | None = None
+        self._current_toast: Toast | None = None
 
-        self._ffmpeg_path = find_ffmpeg()
-        self._ffprobe_path = find_ffprobe()
+        self._resolve_ffmpeg_paths()
 
         self._build_ui()
         self._setup_shortcuts()
@@ -71,11 +75,23 @@ class MainWindow(QMainWindow):
                 self,
                 "ffmpeg / ffprobe が見つかりません",
                 "ffmpeg / ffprobe が見つかりませんでした。\n"
-                "PATH に追加するか、プロジェクト直下の bin フォルダに配置してください。\n"
+                "[設定] から実行ファイルのパスを指定するか、PATH に追加してください。\n"
                 "見つかるまでサムネイル生成・動画の読み込み・編集機能は使用できません。",
             )
 
         self._restore_last_folder()
+
+    def _resolve_ffmpeg_paths(self) -> None:
+        """設定で手動指定されていればそれを、無ければ自動検出したパスを使う。"""
+        if self._app_settings.ffmpeg_path and Path(self._app_settings.ffmpeg_path).is_file():
+            self._ffmpeg_path = Path(self._app_settings.ffmpeg_path)
+        else:
+            self._ffmpeg_path = find_ffmpeg()
+
+        if self._app_settings.ffprobe_path and Path(self._app_settings.ffprobe_path).is_file():
+            self._ffprobe_path = Path(self._app_settings.ffprobe_path)
+        else:
+            self._ffprobe_path = find_ffprobe()
 
     # ------------------------------------------------------------------ UI
 
@@ -91,16 +107,26 @@ class MainWindow(QMainWindow):
         self._path_label = QLabel("(フォルダ未選択)")
         self._path_label.setStyleSheet("color: palette(mid);")
 
+        self._settings_button = QPushButton("設定")
+        self._settings_button.clicked.connect(self._on_settings_clicked)
+        self._open_output_button = QPushButton("出力先を開く")
+        self._open_output_button.clicked.connect(self._on_open_output_clicked)
+
+        saved_thumb_size = self._settings.value(KEY_THUMB_SIZE, 240, int)
         self._size_combo = QComboBox()
         for size in THUMB_SIZES:
             self._size_combo.addItem(f"{size}px", size)
-        self._size_combo.setCurrentIndex(THUMB_SIZES.index(240))
+        self._size_combo.setCurrentIndex(
+            THUMB_SIZES.index(saved_thumb_size) if saved_thumb_size in THUMB_SIZES else THUMB_SIZES.index(240)
+        )
         self._size_combo.currentIndexChanged.connect(self._on_thumb_size_changed)
 
         top_bar.addWidget(self._open_button)
         top_bar.addWidget(self._path_label, 1)
         top_bar.addWidget(QLabel("サムネサイズ:"))
         top_bar.addWidget(self._size_combo)
+        top_bar.addWidget(self._settings_button)
+        top_bar.addWidget(self._open_output_button)
         root_layout.addLayout(top_bar)
 
         # 左: サムネ一覧 / 右: プレビュー+タブ
@@ -185,7 +211,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- フォルダ
 
     def _restore_last_folder(self) -> None:
-        last = self._settings.value(SETTINGS_LAST_FOLDER, "", str)
+        last = self._settings.value(KEY_LAST_FOLDER, "", str)
         if last:
             folder = Path(last)
             if folder.is_dir():
@@ -197,6 +223,41 @@ class MainWindow(QMainWindow):
         if folder:
             self._open_folder(Path(folder))
 
+    def _on_settings_clicked(self) -> None:
+        dialog = SettingsDialog(self._app_settings, self)
+        if dialog.exec() != SettingsDialog.DialogCode.Accepted:
+            return
+
+        self._app_settings = dialog.result_settings()
+        save_app_settings(self._settings, self._app_settings)
+        self._resolve_ffmpeg_paths()
+
+        if self._ffmpeg_path is None or self._ffprobe_path is None:
+            QMessageBox.warning(
+                self, "ffmpeg / ffprobe が見つかりません",
+                "指定されたパスが見つかりませんでした。設定を確認してください。",
+            )
+        else:
+            self._show_toast("設定を保存しました。次にフォルダを開いたときから反映されます。")
+
+    def _on_open_output_clicked(self) -> None:
+        item = self._player_panel.current_item
+        if item is not None:
+            output_dir = self._effective_output_dir(item.path.parent)
+        elif self._current_folder is not None:
+            output_dir = self._effective_output_dir(self._current_folder)
+        else:
+            QMessageBox.information(self, "出力先を開く", "先にフォルダを選択するか、動画を選んでください。")
+            return
+
+        if not output_dir.is_dir():
+            QMessageBox.information(self, "出力先を開く", f"まだ出力先フォルダがありません:\n{output_dir}")
+            return
+        try:
+            subprocess.Popen(["explorer", str(output_dir)])
+        except OSError:
+            pass
+
     def _open_folder(self, folder: Path) -> None:
         self._generation += 1
         generation = self._generation
@@ -204,12 +265,12 @@ class MainWindow(QMainWindow):
 
         self._current_folder = folder
         self._path_label.setText(str(folder))
-        self._settings.setValue(SETTINGS_LAST_FOLDER, str(folder))
+        self._settings.setValue(KEY_LAST_FOLDER, str(folder))
         self._grid.clear()
         self._player_panel.clear()
 
         try:
-            files = scan_folder(folder)
+            files = scan_folder(folder, set(self._app_settings.extensions))
         except OSError as exc:
             QMessageBox.warning(self, "フォルダを読み込めません", str(exc))
             return
@@ -242,6 +303,7 @@ class MainWindow(QMainWindow):
     def _on_thumb_size_changed(self, index: int) -> None:
         size = self._size_combo.itemData(index)
         self._grid.set_thumb_size(size)
+        self._settings.setValue(KEY_THUMB_SIZE, size)
 
     # --------------------------------------------------------------- 選択
 
@@ -278,10 +340,16 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------------- 実行
 
+    def _effective_output_dir(self, containing_folder: Path) -> Path:
+        """設定で出力先が指定されていればそれを、無ければ元動画フォルダ直下の output/ を使う。"""
+        if self._app_settings.output_dir:
+            return Path(self._app_settings.output_dir)
+        return containing_folder / "output"
+
     def _prepare_output(self, item: VideoItem, suffix: str) -> Path | None:
         """出力先フォルダを用意し、出力ファイルパスを返す。書き込めない場合は None。"""
         src = item.path
-        output_dir = src.parent / "output"
+        output_dir = self._effective_output_dir(src.parent)
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -380,23 +448,39 @@ class MainWindow(QMainWindow):
         self._set_progress_row_visible(False)
 
         if success:
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Information)
-            box.setWindowTitle("完了")
-            box.setText(f"{operation_label}が完了しました:\n{dst}{snap_note}")
-            open_button = box.addButton("フォルダを開く", QMessageBox.ButtonRole.ActionRole)
-            box.addButton(QMessageBox.StandardButton.Ok)
-            box.exec()
-            if box.clickedButton() == open_button:
-                self._open_in_explorer(dst)
+            self._show_toast(
+                f"{operation_label}が完了しました: {dst.name}{snap_note}",
+                action_text="フォルダを開く",
+                on_action=lambda: self._open_in_explorer(dst),
+            )
             return
 
         if message == "キャンセルされました":
-            QMessageBox.information(self, "キャンセル", "処理をキャンセルしました。")
+            self._show_toast("処理をキャンセルしました。")
             return
 
+        log_path = self._write_error_log(operation_label, message)
         tail = "\n".join(message.splitlines()[-20:])
-        QMessageBox.critical(self, "処理に失敗しました", tail or "不明なエラーが発生しました。")
+        log_note = f"\n\n詳細ログ: {log_path}" if log_path is not None else ""
+        QMessageBox.critical(
+            self, "処理に失敗しました", (tail or "不明なエラーが発生しました。") + log_note,
+        )
+
+    def _show_toast(self, message: str, action_text: str | None = None, on_action=None) -> None:
+        if self._current_toast is not None:
+            self._current_toast.close()
+        self._current_toast = Toast(self, message, action_text=action_text, on_action=on_action)
+
+    def _write_error_log(self, operation_label: str, message: str) -> Path | None:
+        """§11: ffmpeg が非ゼロ終了した際の全文ログを保存する(ダイアログには末尾20行のみ表示)。"""
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = LOG_DIR / f"{timestamp}_{operation_label}.log"
+            log_path.write_text(message, encoding="utf-8")
+            return log_path
+        except OSError:
+            return None
 
     def _open_in_explorer(self, path: Path) -> None:
         try:
