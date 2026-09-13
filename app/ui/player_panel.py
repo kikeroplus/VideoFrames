@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QUrl, Signal
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtCore import QTimer, QUrl, Signal
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -26,6 +27,16 @@ from PySide6.QtCore import Qt
 from app.core.models import VideoItem
 from app.utils.timecode import seconds_to_frame, seconds_to_timecode
 
+IN_OUT_THUMB_SIZE = (96, 54)  # 幅, 高さ(px)
+
+# QVideoWidget が他ウィジェットに埋め込まれていると、一度も play() していない
+# 状態では videoFrameChanged が発火せず、シークだけでは映像が更新されない
+# (トップレベルウィンドウとして単体表示した場合のみ例外的に動く)。
+# ロード直後に極短時間だけ無音で再生してレンダリングパイプラインを
+# 初期化する(「プライミング」)ことで、以後は再生なしのシークでも
+# 正しく映像・サムネイルが得られるようにする。
+PRIME_DURATION_MS = 120
+
 
 class PlayerPanel(QWidget):
     in_point_changed = Signal(object)  # float | None
@@ -37,6 +48,7 @@ class PlayerPanel(QWidget):
         self._in_point_s: float | None = None
         self._out_point_s: float | None = None
         self._seeking_by_user = False
+        self._latest_frame_image: QImage | None = None
 
         self._player = QMediaPlayer(self)
         self._audio_output = QAudioOutput(self)
@@ -45,6 +57,7 @@ class PlayerPanel(QWidget):
         self._video_widget = QVideoWidget(self)
         self._video_widget.setMinimumHeight(240)
         self._player.setVideoOutput(self._video_widget)
+        self._video_widget.videoSink().videoFrameChanged.connect(self._on_video_frame)
 
         self._header_label = QLabel("動画を選択してください")
         self._header_label.setStyleSheet("color: palette(mid);")
@@ -57,10 +70,14 @@ class PlayerPanel(QWidget):
         self._slider.sliderReleased.connect(self._on_slider_released)
 
         self._back10_button = QPushButton("◄◄ 10s")
+        self._back1_button = QPushButton("◄ 1s")
         self._play_button = QPushButton("▶")
+        self._fwd1_button = QPushButton("1s ▶")
         self._fwd10_button = QPushButton("10s ▶▶")
         self._back10_button.clicked.connect(lambda: self.step_seconds(-10))
+        self._back1_button.clicked.connect(lambda: self.step_seconds(-1))
         self._play_button.clicked.connect(self.toggle_play_pause)
+        self._fwd1_button.clicked.connect(lambda: self.step_seconds(1))
         self._fwd10_button.clicked.connect(lambda: self.step_seconds(10))
 
         self._time_label = QLabel("00:00:00.000 (frame 0) / 00:00:00.000")
@@ -74,11 +91,17 @@ class PlayerPanel(QWidget):
         self._out_button = QPushButton("OUT設定")
         self._in_button.clicked.connect(self.set_in_point)
         self._out_button.clicked.connect(self.set_out_point)
-        self._in_out_label = QLabel("IN: -   OUT: -")
+
+        self._in_thumb_label = self._make_thumb_label()
+        self._out_thumb_label = self._make_thumb_label()
+        self._in_text_label = QLabel("IN: -")
+        self._out_text_label = QLabel("OUT: -")
 
         controls_row = QHBoxLayout()
         controls_row.addWidget(self._back10_button)
+        controls_row.addWidget(self._back1_button)
         controls_row.addWidget(self._play_button)
+        controls_row.addWidget(self._fwd1_button)
         controls_row.addWidget(self._fwd10_button)
         controls_row.addWidget(self._time_label, 1)
 
@@ -86,8 +109,19 @@ class PlayerPanel(QWidget):
         frame_row.addWidget(self._frame_back_button)
         frame_row.addWidget(self._frame_fwd_button)
         frame_row.addStretch(1)
-        frame_row.addWidget(self._in_button)
-        frame_row.addWidget(self._out_button)
+
+        in_out_row = QHBoxLayout()
+        in_out_row.addWidget(self._in_thumb_label)
+        in_col = QVBoxLayout()
+        in_col.addWidget(self._in_text_label)
+        in_col.addWidget(self._in_button)
+        in_out_row.addLayout(in_col)
+        in_out_row.addStretch(1)
+        in_out_row.addWidget(self._out_thumb_label)
+        out_col = QVBoxLayout()
+        out_col.addWidget(self._out_text_label)
+        out_col.addWidget(self._out_button)
+        in_out_row.addLayout(out_col)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._header_label)
@@ -95,12 +129,15 @@ class PlayerPanel(QWidget):
         layout.addWidget(self._slider)
         layout.addLayout(controls_row)
         layout.addLayout(frame_row)
-        layout.addWidget(self._in_out_label)
+        layout.addLayout(in_out_row)
+
+        self._pending_prime = False
 
         self._player.positionChanged.connect(self._on_position_changed)
         self._player.durationChanged.connect(self._on_duration_changed)
         self._player.playbackStateChanged.connect(self._on_playback_state_changed)
         self._player.errorOccurred.connect(self._on_error)
+        self._player.mediaStatusChanged.connect(self._on_media_status_changed)
 
         self._set_controls_enabled(False)
 
@@ -110,21 +147,26 @@ class PlayerPanel(QWidget):
         self._item = item
         self._in_point_s = None
         self._out_point_s = None
+        self._latest_frame_image = None
         self.in_point_changed.emit(None)
         self.out_point_changed.emit(None)
         self._update_in_out_label()
+        self._in_thumb_label.clear()
+        self._out_thumb_label.clear()
 
         self._header_label.setText(
             f"{item.path.name}  ({item.width}x{item.height}  {item.fps:.2f}fps  "
             f"video:{item.vcodec} audio:{item.acodec or 'なし'})"
         )
         self._player.stop()
+        self._pending_prime = True
         self._player.setSource(QUrl.fromLocalFile(str(item.path)))
         self._set_controls_enabled(True)
         self._update_time_label(0.0)
 
     def show_loading(self, path: Path) -> None:
         self._item = None
+        self._pending_prime = False
         self._player.stop()
         self._player.setSource(QUrl())
         self._header_label.setText(f"{path.name}  読み込み中…")
@@ -132,6 +174,7 @@ class PlayerPanel(QWidget):
 
     def show_error(self, path: Path, message: str) -> None:
         self._item = None
+        self._pending_prime = False
         self._player.stop()
         self._player.setSource(QUrl())
         self._header_label.setText(f"{path.name}  読み込み不可: {message}")
@@ -139,6 +182,7 @@ class PlayerPanel(QWidget):
 
     def clear(self) -> None:
         self._item = None
+        self._pending_prime = False
         self._player.stop()
         self._player.setSource(QUrl())
         self._header_label.setText("動画を選択してください")
@@ -173,6 +217,7 @@ class PlayerPanel(QWidget):
             return
         self._in_point_s = self._player.position() / 1000.0
         self._update_in_out_label()
+        self._set_thumb(self._in_thumb_label)
         self.in_point_changed.emit(self._in_point_s)
 
     def set_out_point(self) -> None:
@@ -180,6 +225,7 @@ class PlayerPanel(QWidget):
             return
         self._out_point_s = self._player.position() / 1000.0
         self._update_in_out_label()
+        self._set_thumb(self._out_thumb_label)
         self.out_point_changed.emit(self._out_point_s)
 
     @property
@@ -199,9 +245,32 @@ class PlayerPanel(QWidget):
 
     # -------------------------------------------------------------- 内部
 
+    def _make_thumb_label(self) -> QLabel:
+        label = QLabel()
+        label.setFixedSize(*IN_OUT_THUMB_SIZE)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("background: palette(dark); border: 1px solid palette(mid);")
+        return label
+
+    def _set_thumb(self, label: QLabel) -> None:
+        if self._latest_frame_image is None:
+            return
+        pixmap = QPixmap.fromImage(self._latest_frame_image).scaled(
+            *IN_OUT_THUMB_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        label.setPixmap(pixmap)
+
+    def _on_video_frame(self, frame: QVideoFrame) -> None:
+        if frame.isValid():
+            self._latest_frame_image = frame.toImage()
+
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
-            self._slider, self._back10_button, self._play_button, self._fwd10_button,
+            self._slider,
+            self._back10_button, self._back1_button, self._play_button,
+            self._fwd1_button, self._fwd10_button,
             self._frame_back_button, self._frame_fwd_button,
             self._in_button, self._out_button,
         ):
@@ -210,7 +279,8 @@ class PlayerPanel(QWidget):
     def _update_in_out_label(self) -> None:
         in_text = seconds_to_timecode(self._in_point_s) if self._in_point_s is not None else "-"
         out_text = seconds_to_timecode(self._out_point_s) if self._out_point_s is not None else "-"
-        self._in_out_label.setText(f"IN: {in_text}   OUT: {out_text}")
+        self._in_text_label.setText(f"IN: {in_text}")
+        self._out_text_label.setText(f"OUT: {out_text}")
 
     def _update_time_label(self, position_s: float) -> None:
         fps = self._item.fps if self._item else 0.0
@@ -238,6 +308,29 @@ class PlayerPanel(QWidget):
         if error == QMediaPlayer.Error.NoError:
             return
         self._header_label.setText(f"再生エラー: {error_string}")
+
+    def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
+        if not self._pending_prime:
+            return
+        loaded_statuses = (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        )
+        if status in loaded_statuses:
+            self._pending_prime = False
+            self._prime_video_pipeline()
+
+    def _prime_video_pipeline(self) -> None:
+        was_muted = self._audio_output.isMuted()
+        self._audio_output.setMuted(True)
+        self._player.play()
+
+        def finish_priming() -> None:
+            self._player.pause()
+            self._player.setPosition(0)
+            self._audio_output.setMuted(was_muted)
+
+        QTimer.singleShot(PRIME_DURATION_MS, finish_priming)
 
     def _on_slider_pressed(self) -> None:
         self._seeking_by_user = True
