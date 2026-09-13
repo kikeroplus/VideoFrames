@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from app.core.models import VideoItem
+from app.utils.subprocess_flags import hidden_subprocess_kwargs
 
 
 class ProbeError(Exception):
@@ -39,7 +40,10 @@ def probe_video(path: Path, ffprobe_path: Path) -> VideoItem:
     ]
     try:
         # ffprobe の出力は常に UTF-8。Windows のロケール(cp932等)に引きずられないよう明示する。
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            **hidden_subprocess_kwargs(),
+        )
     except OSError as exc:
         raise ProbeError(f"ffprobe の実行に失敗しました: {exc}") from exc
 

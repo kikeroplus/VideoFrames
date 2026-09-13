@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from app.utils.paths import cache_key_for
+from app.utils.subprocess_flags import hidden_subprocess_kwargs
 
 CACHE_DIR = Path(os.environ["LOCALAPPDATA"]) / "VideoTrimmer" / "thumbs"
 
@@ -39,7 +40,7 @@ def get_or_create_thumbnail(path: Path, duration: float, ffmpeg_path: Path) -> P
         str(cache_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, **hidden_subprocess_kwargs())
     except OSError:
         return None
 

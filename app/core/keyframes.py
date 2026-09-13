@@ -11,6 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.utils.paths import cache_key_for
+from app.utils.subprocess_flags import hidden_subprocess_kwargs
 
 CACHE_DIR = Path(os.environ["LOCALAPPDATA"]) / "VideoTrimmer" / "keyframes"
 
@@ -59,7 +60,10 @@ def _probe_keyframes(path: Path, ffprobe_path: Path) -> list[float]:
         str(path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            **hidden_subprocess_kwargs(),
+        )
     except OSError as exc:
         raise KeyframeError(f"ffprobe の実行に失敗しました: {exc}") from exc
 

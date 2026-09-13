@@ -11,12 +11,10 @@ from typing import Callable
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.core.edit_ops import Strategy, build_cut_cmd
+from app.utils.subprocess_flags import hidden_subprocess_kwargs
 
 # app/core/ffmpeg_runner.py から見てプロジェクトルート（VideoTrimmer/ 相当）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-
-# Windows でサブプロセス起動時にコンソールウィンドウを出さない
-_CREATE_NO_WINDOW = 0x08000000
 
 CANCELLED = "__cancelled__"  # _run_ffmpeg がキャンセルを示すために使う特別なメッセージ
 
@@ -79,7 +77,7 @@ def _run_ffmpeg(
             text=True,
             encoding="utf-8",
             bufsize=1,
-            creationflags=_CREATE_NO_WINDOW,
+            **hidden_subprocess_kwargs(),
         )
     except OSError as exc:
         return False, f"ffmpeg の起動に失敗しました: {exc}"
