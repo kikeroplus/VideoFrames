@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.edit_ops import CutDecision, CutMode, decide_cut_strategy
+from app.core.edit_ops import CutDecision, CutMode, decide_cut_strategy, format_cut_status
 from app.core.keyframes import next_keyframe, prev_keyframe
 from app.ui.player_panel import PlayerPanel
 from app.utils.timecode import seconds_to_timecode
@@ -341,46 +341,18 @@ class ExtractPanel(QWidget):
         )
 
     def _render_cut_status(self, decision: CutDecision, cut_mode: CutMode, keyframe_state: str) -> None:
-        unavailable_note = ""
-        if keyframe_state == "unavailable":
-            unavailable_note = "(キーフレーム判定不能のため安全側で再エンコードします) "
-
-        if decision.strategy == "copy":
-            if decision.snapped:
-                self._cut_status_label.setText(
-                    f"✅ {unavailable_note}コピー優先: 開始点を "
-                    f"{seconds_to_timecode(decision.start)} へスナップして処理します(高速)。"
-                )
-            else:
-                self._cut_status_label.setText(f"✅ {unavailable_note}再エンコードなしで処理できます(高速)。")
-            self._snap_prev_button.setVisible(False)
-            self._snap_next_button.setVisible(False)
-            return
-
-        if cut_mode == "always_encode":
-            self._cut_status_label.setText("常に再エンコードで処理します。")
-            self._snap_prev_button.setVisible(False)
-            self._snap_next_button.setVisible(False)
-            return
-
-        # ここに来るのは strategy == "encode" かつ auto/copy_priority で
-        # スナップ先が見つからなかった場合
-        lines = [f"⚠ {unavailable_note}開始点がキーフレーム上にありません。このまま実行すると再エンコードします。"]
-        nearest_parts = []
-        if decision.nearest_prev is not None:
-            diff = decision.start - decision.nearest_prev
-            nearest_parts.append(f"-{diff:.2f}秒 ({seconds_to_timecode(decision.nearest_prev)})")
-        if decision.nearest_next is not None:
-            diff = decision.nearest_next - decision.start
-            nearest_parts.append(f"+{diff:.2f}秒 ({seconds_to_timecode(decision.nearest_next)})")
-        if nearest_parts:
-            lines.append("最寄り: " + " / ".join(nearest_parts))
-        self._cut_status_label.setText("\n".join(lines))
-        self._snap_prev_button.setVisible(decision.nearest_prev is not None and cut_mode == "auto")
-        self._snap_next_button.setVisible(decision.nearest_next is not None and cut_mode == "auto")
+        text, show_prev, show_next = format_cut_status(decision, cut_mode, keyframe_state)
+        self._cut_status_label.setText(text)
+        self._snap_prev_button.setVisible(show_prev)
+        self._snap_next_button.setVisible(show_next)
 
     # --------------------------------------------------------------- 実行
 
     def _on_execute_clicked(self) -> None:
         if self._pending_request is not None:
             self.execute_requested.emit(self._pending_request)
+
+    def trigger_execute(self) -> None:
+        """Enterキー等、外部からの実行トリガー用。ボタンが有効な場合のみ実行する。"""
+        if self._execute_button.isEnabled():
+            self._execute_button.click()

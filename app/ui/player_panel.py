@@ -114,6 +114,7 @@ class PlayerPanel(QWidget):
     in_point_changed = Signal(object)  # float | None
     out_point_changed = Signal(object)  # float | None
     keyframes_changed = Signal()
+    video_changed = Signal()  # 選択中の動画が切り替わった(読込/読込中/エラー/クリアの全パターン)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -267,6 +268,7 @@ class PlayerPanel(QWidget):
         self._player.setSource(QUrl.fromLocalFile(str(item.path)))
         self._set_controls_enabled(True)
         self._update_time_label(0.0)
+        self.video_changed.emit()
 
     def show_loading(self, path: Path) -> None:
         self._cancel_preview_watch()
@@ -277,6 +279,7 @@ class PlayerPanel(QWidget):
         self._header_label.setText(f"{path.name}  読み込み中…")
         self._set_controls_enabled(False)
         self._reset_keyframe_display()
+        self.video_changed.emit()
 
     def show_error(self, path: Path, message: str) -> None:
         self._cancel_preview_watch()
@@ -287,6 +290,7 @@ class PlayerPanel(QWidget):
         self._header_label.setText(f"{path.name}  読み込み不可: {message}")
         self._set_controls_enabled(False)
         self._reset_keyframe_display()
+        self.video_changed.emit()
 
     def clear(self) -> None:
         self._cancel_preview_watch()
@@ -297,6 +301,7 @@ class PlayerPanel(QWidget):
         self._header_label.setText("動画を選択してください")
         self._set_controls_enabled(False)
         self._reset_keyframe_display()
+        self.video_changed.emit()
 
     def _reset_keyframe_display(self) -> None:
         self._keyframes = None
@@ -438,14 +443,21 @@ class PlayerPanel(QWidget):
             self._player.pause()
             self._player.setPosition(round(target * 1000))
 
-    def _seek_to_marked_point(self, seconds: float | None) -> None:
-        """IN/OUTサムネイルクリック時、その位置へ再生ヘッドを移動する。"""
+    def seek_to(self, seconds: float) -> None:
+        """任意の位置へシークする(削除タブなど他パネルからの利用も想定した公開API)。"""
         self._cancel_preview_watch()
-        if self._item is None or seconds is None:
+        if self._item is None:
             return
         self._priming_active = False
         self._player.pause()
-        self._player.setPosition(round(seconds * 1000))
+        clamped = max(0.0, min(seconds, self._item.duration))
+        self._player.setPosition(round(clamped * 1000))
+
+    def _seek_to_marked_point(self, seconds: float | None) -> None:
+        """IN/OUTサムネイルクリック時、その位置へ再生ヘッドを移動する。"""
+        if seconds is None:
+            return
+        self.seek_to(seconds)
 
     def toggle_preview_in_out(self) -> None:
         """IN点からOUT点までを再生し、OUT点で自動的に一時停止する。"""

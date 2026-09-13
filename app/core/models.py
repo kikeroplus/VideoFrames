@@ -19,6 +19,7 @@ class VideoItem:
     size_bytes: int
     thumb_path: Path | None = None  # キャッシュ済みサムネ
     keyframes: list[float] | None = None  # 遅延取得。§8参照
+    is_vfr: bool = False  # 可変フレームレート(VFR)かどうか。§6のフレーム単位入力の警告に使う
 
 
 @dataclass

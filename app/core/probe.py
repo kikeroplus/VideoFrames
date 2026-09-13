@@ -70,13 +70,19 @@ def probe_video(path: Path, ffprobe_path: Path) -> VideoItem:
     except (TypeError, ValueError):
         size_bytes = 0
 
+    r_frame_rate = _parse_frame_rate(video_stream.get("r_frame_rate", "0/1"))
+    avg_frame_rate = _parse_frame_rate(video_stream.get("avg_frame_rate", "0/1"))
+    # r_frame_rate と avg_frame_rate が大きくずれている場合はVFR(可変フレームレート)とみなす
+    is_vfr = avg_frame_rate > 0 and abs(r_frame_rate - avg_frame_rate) > 0.01
+
     return VideoItem(
         path=path,
         duration=duration,
-        fps=_parse_frame_rate(video_stream.get("r_frame_rate", "0/1")),
+        fps=r_frame_rate,
         width=int(video_stream.get("width", 0)),
         height=int(video_stream.get("height", 0)),
         vcodec=video_stream.get("codec_name", ""),
         acodec=audio_stream.get("codec_name") if audio_stream else None,
         size_bytes=size_bytes,
+        is_vfr=is_vfr,
     )

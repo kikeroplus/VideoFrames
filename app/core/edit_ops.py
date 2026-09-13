@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import Literal
 
 from app.core.keyframes import can_copy, next_keyframe, prev_keyframe
+from app.utils.timecode import seconds_to_timecode
 
 CutMode = Literal["auto", "copy_priority", "always_encode"]
 Strategy = Literal["copy", "encode"]
+DeleteMode = Literal["head", "tail", "middle"]
 
 
 @dataclass
@@ -100,3 +102,60 @@ def build_cut_cmd(
 
     cmd += ["-avoid_negative_ts", "make_zero", "-y", str(dst)]
     return cmd
+
+
+def residual_ranges_head(n: float, duration: float) -> list[tuple[float, float]]:
+    """冒頭からN秒削除した場合の残す区間。仕様書 §6 参照。"""
+    return [(n, duration)]
+
+
+def residual_ranges_tail(n: float, duration: float) -> list[tuple[float, float]]:
+    """末尾からN秒削除した場合の残す区間。仕様書 §6 参照。"""
+    return [(0.0, duration - n)]
+
+
+def residual_ranges_middle(a: float, b: float, duration: float) -> list[tuple[float, float]]:
+    """A〜Bを削除した場合の残す区間(2区間)。仕様書 §6 参照。"""
+    return [(0.0, a), (b, duration)]
+
+
+def format_cut_status(
+    decision: CutDecision, cut_mode: CutMode, keyframe_state: str, can_snap: bool = True,
+) -> tuple[str, bool, bool]:
+    """§8.4 共通UIのステータス文言とスナップボタンの表示要否を組み立てる。
+
+    抜き出し/削除タブで共通利用する。戻り値は (表示テキスト, 手前ボタン表示, 奥ボタン表示)。
+    """
+    unavailable_note = (
+        "(キーフレーム判定不能のため安全側で再エンコードします) " if keyframe_state == "unavailable" else ""
+    )
+
+    if decision.strategy == "copy":
+        if decision.snapped:
+            text = (
+                f"✅ {unavailable_note}コピー優先: 開始点を "
+                f"{seconds_to_timecode(decision.start)} へスナップして処理します(高速)。"
+            )
+        else:
+            text = f"✅ {unavailable_note}再エンコードなしで処理できます(高速)。"
+        return text, False, False
+
+    if cut_mode == "always_encode":
+        return "常に再エンコードで処理します。", False, False
+
+    lines = [f"⚠ {unavailable_note}開始点がキーフレーム上にありません。このまま実行すると再エンコードします。"]
+    nearest_parts = []
+    if decision.nearest_prev is not None:
+        diff = decision.start - decision.nearest_prev
+        nearest_parts.append(f"-{diff:.2f}秒 ({seconds_to_timecode(decision.nearest_prev)})")
+    if decision.nearest_next is not None:
+        diff = decision.nearest_next - decision.start
+        nearest_parts.append(f"+{diff:.2f}秒 ({seconds_to_timecode(decision.nearest_next)})")
+    if nearest_parts:
+        lines.append("最寄り: " + " / ".join(nearest_parts))
+    text = "\n".join(lines)
+
+    show_snap = can_snap and cut_mode == "auto"
+    show_prev = show_snap and decision.nearest_prev is not None
+    show_next = show_snap and decision.nearest_next is not None
+    return text, show_prev, show_next

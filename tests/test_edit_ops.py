@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from app.core.edit_ops import build_cut_cmd, decide_cut_strategy
+from app.core.edit_ops import (
+    build_cut_cmd,
+    decide_cut_strategy,
+    format_cut_status,
+    residual_ranges_head,
+    residual_ranges_middle,
+    residual_ranges_tail,
+)
 
 KEYFRAMES = [0.0, 2.0, 4.0, 6.0, 10.0]
 FPS = 30.0
@@ -112,3 +119,53 @@ class TestBuildCutCmd:
         )
         assert "-c:a" not in cmd
         assert "-an" in cmd
+
+
+class TestResidualRanges:
+    def test_head(self):
+        assert residual_ranges_head(5.0, 600.0) == [(5.0, 600.0)]
+
+    def test_tail(self):
+        assert residual_ranges_tail(5.0, 600.0) == [(0.0, 595.0)]
+
+    def test_middle(self):
+        assert residual_ranges_middle(10.0, 20.0, 600.0) == [(0.0, 10.0), (20.0, 600.0)]
+
+
+class TestFormatCutStatus:
+    def test_copy_no_snap(self):
+        d = decide_cut_strategy(2.0, KEYFRAMES, FPS, "auto")
+        text, show_prev, show_next = format_cut_status(d, "auto", "ready")
+        assert text.startswith("✅")
+        assert "スナップ" not in text
+        assert show_prev is False and show_next is False
+
+    def test_copy_snapped(self):
+        d = decide_cut_strategy(3.0, KEYFRAMES, FPS, "copy_priority")
+        text, show_prev, show_next = format_cut_status(d, "copy_priority", "ready")
+        assert text.startswith("✅")
+        assert "スナップ" in text
+        assert show_prev is False and show_next is False
+
+    def test_encode_auto_mode_shows_snap_buttons(self):
+        d = decide_cut_strategy(3.0, KEYFRAMES, FPS, "auto")
+        text, show_prev, show_next = format_cut_status(d, "auto", "ready")
+        assert text.startswith("⚠")
+        assert "最寄り" in text
+        assert show_prev is True and show_next is True
+
+    def test_encode_always_mode_hides_snap_buttons(self):
+        d = decide_cut_strategy(2.0, KEYFRAMES, FPS, "always_encode")
+        text, show_prev, show_next = format_cut_status(d, "always_encode", "ready")
+        assert text == "常に再エンコードで処理します。"
+        assert show_prev is False and show_next is False
+
+    def test_can_snap_false_suppresses_buttons(self):
+        d = decide_cut_strategy(3.0, KEYFRAMES, FPS, "auto")
+        text, show_prev, show_next = format_cut_status(d, "auto", "ready", can_snap=False)
+        assert show_prev is False and show_next is False
+
+    def test_unavailable_note_included(self):
+        d = decide_cut_strategy(3.0, [], FPS, "auto")
+        text, _, _ = format_cut_status(d, "auto", "unavailable")
+        assert "判定不能" in text
