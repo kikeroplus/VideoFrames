@@ -1,7 +1,9 @@
-"""メインウィンドウ。Phase 2: フォルダ選択 + サムネ一覧 + プレビュー再生。"""
+"""メインウィンドウ。Phase 3: フォルダ選択 + サムネ一覧 + プレビュー再生 + 抜き出し。"""
 
 from __future__ import annotations
 
+import subprocess
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, QThreadPool, Qt
@@ -13,18 +15,24 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from app.core.ffmpeg_runner import find_ffmpeg, find_ffprobe
+from app.core.edit_ops import build_cut_cmd
+from app.core.ffmpeg_runner import FFmpegJob, find_ffmpeg, find_ffprobe
 from app.core.keyframes import KeyframeWorker
 from app.core.models import VideoItem
 from app.core.video_loader import LoadVideoWorker, scan_folder
+from app.ui.extract_panel import ExtractPanel, ExtractRequest
 from app.ui.player_panel import PlayerPanel
 from app.ui.thumbnail_grid import THUMB_SIZES, ThumbnailGrid
+from app.utils.paths import next_output_path
+from app.utils.timecode import seconds_to_timecode
 
 ORG_NAME = "VideoTrimmer"
 APP_NAME = "VideoTrimmer"
@@ -41,6 +49,10 @@ class MainWindow(QMainWindow):
         self._settings = QSettings(ORG_NAME, APP_NAME)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(MAX_PARALLEL_LOADS)
+        self._job_pool = QThreadPool(self)
+        self._job_pool.setMaxThreadCount(1)  # 編集ジョブは同時に1つだけ
+        self._current_job: FFmpegJob | None = None
+        self._job_start_time: float = 0.0
         self._generation = 0
         self._current_folder: Path | None = None
 
@@ -87,17 +99,49 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self._size_combo)
         root_layout.addLayout(top_bar)
 
-        # 左: サムネ一覧 / 右: プレビュー
+        # 左: サムネ一覧 / 右: プレビュー+タブ
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self._grid = ThumbnailGrid()
         self._grid.video_selected.connect(self._on_video_selected)
         self._player_panel = PlayerPanel()
 
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self._player_panel, 1)
+
+        self._tab_widget = QTabWidget()
+        self._extract_panel = ExtractPanel(self._player_panel)
+        self._extract_panel.execute_requested.connect(self._on_extract_requested)
+        self._tab_widget.addTab(self._extract_panel, "抜き出し")
+        right_layout.addWidget(self._tab_widget)
+
         splitter.addWidget(self._grid)
-        splitter.addWidget(self._player_panel)
+        splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         root_layout.addWidget(splitter, 1)
+
+        # 下部: 進捗バー
+        progress_row = QHBoxLayout()
+        self._progress_label = QLabel("進捗:")
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._remaining_label = QLabel("")
+        self._cancel_button = QPushButton("キャンセル")
+        self._cancel_button.clicked.connect(self._on_cancel_clicked)
+        progress_row.addWidget(self._progress_label)
+        progress_row.addWidget(self._progress_bar, 1)
+        progress_row.addWidget(self._remaining_label)
+        progress_row.addWidget(self._cancel_button)
+        root_layout.addLayout(progress_row)
+        self._set_progress_row_visible(False)
+
+    def _set_progress_row_visible(self, visible: bool) -> None:
+        for widget in (
+            self._progress_label, self._progress_bar, self._remaining_label, self._cancel_button,
+        ):
+            widget.setVisible(visible)
 
     def _setup_shortcuts(self) -> None:
         # 仕様書 §5.3 のキーボードショートカット。
@@ -118,7 +162,7 @@ class MainWindow(QMainWindow):
         bind("O", self._player_panel.set_out_point)
         bind(",", self._player_panel.jump_to_prev_keyframe)
         bind(".", self._player_panel.jump_to_next_keyframe)
-        # Enter での実行は、抜き出し/削除タブが揃う Phase 3/4 で実装する
+        # Enter での実行は、削除タブも揃う Phase 4 で実装する
 
     # ------------------------------------------------------------- フォルダ
 
@@ -213,3 +257,98 @@ class MainWindow(QMainWindow):
 
     def _on_keyframes_failed(self, path: Path, message: str) -> None:
         self._player_panel.set_keyframes_unavailable(path)
+
+    # --------------------------------------------------------------- 実行
+
+    def _on_extract_requested(self, request: ExtractRequest) -> None:
+        if self._current_job is not None:
+            return  # 実行中は無視(ボタンは無効化されているはずだが念のため)
+
+        item = self._player_panel.current_item
+        if item is None or self._ffmpeg_path is None:
+            return
+
+        src = item.path
+        output_dir = src.parent / "output"
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "出力先に書き込めません", str(exc))
+            return
+
+        dst = next_output_path(src, output_dir, "clip")
+        assert dst != src, "出力先が元ファイルと同じになっています"
+
+        decision = request.decision
+        cmd = build_cut_cmd(
+            self._ffmpeg_path, src, dst,
+            start=decision.start, end=request.out_s,
+            strategy=decision.strategy, vcodec=item.vcodec,
+            has_audio=item.acodec is not None, exclude_audio=request.exclude_audio,
+        )
+
+        job = FFmpegJob(cmd, total_duration_s=request.out_s - decision.start, dst=dst)
+        job.signals.progress.connect(self._on_job_progress)
+        job.signals.finished.connect(
+            lambda ok, msg: self._on_job_finished(ok, msg, dst, decision.snapped, decision.start)
+        )
+
+        self._current_job = job
+        self._job_start_time = time.monotonic()
+        self._set_ui_busy(True)
+        self._job_pool.start(job)
+
+    def _on_job_progress(self, fraction: float) -> None:
+        self._progress_bar.setValue(round(fraction * 100))
+        elapsed = time.monotonic() - self._job_start_time
+        if fraction > 0.02:
+            remaining = elapsed * (1.0 - fraction) / fraction
+            self._remaining_label.setText(f"残り約 {round(remaining)}秒")
+        else:
+            self._remaining_label.setText("")
+
+    def _on_job_finished(self, success: bool, message: str, dst: Path, snapped: bool, used_start: float) -> None:
+        self._current_job = None
+        self._set_ui_busy(False)
+        self._set_progress_row_visible(False)
+
+        if success:
+            snap_note = f"\n(開始点を {seconds_to_timecode(used_start)} にスナップして処理しました)" if snapped else ""
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("完了")
+            box.setText(f"抜き出しが完了しました:\n{dst}{snap_note}")
+            open_button = box.addButton("フォルダを開く", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Ok)
+            box.exec()
+            if box.clickedButton() == open_button:
+                self._open_in_explorer(dst)
+            return
+
+        if message == "キャンセルされました":
+            QMessageBox.information(self, "キャンセル", "処理をキャンセルしました。")
+            return
+
+        tail = "\n".join(message.splitlines()[-20:])
+        QMessageBox.critical(self, "処理に失敗しました", tail or "不明なエラーが発生しました。")
+
+    def _open_in_explorer(self, path: Path) -> None:
+        try:
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        except OSError:
+            pass
+
+    def _on_cancel_clicked(self) -> None:
+        if self._current_job is not None:
+            self._current_job.cancel()
+            self._cancel_button.setEnabled(False)
+
+    def _set_ui_busy(self, busy: bool) -> None:
+        self._grid.setEnabled(not busy)
+        self._open_button.setEnabled(not busy)
+        self._extract_panel.set_running(busy)
+        self._set_progress_row_visible(busy)
+        if busy:
+            self._progress_bar.setValue(0)
+            self._remaining_label.setText("")
+            self._cancel_button.setEnabled(True)

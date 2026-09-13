@@ -14,3 +14,19 @@ def cache_key_for(path: Path) -> str:
     st = path.stat()
     raw = f"{path.resolve()}|{st.st_mtime}|{st.st_size}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def next_output_path(src: Path, output_dir: Path, suffix: str) -> Path:
+    """出力ファイルパスを生成する。仕様書 §9 参照。
+
+    `{元名}_{suffix}_{連番3桁}{元拡張子}` の形式。既存ファイルを走査して
+    未使用の番号を採用する(既存ファイルは上書きしない)。
+    """
+    stem = src.stem
+    ext = src.suffix
+    n = 1
+    while True:
+        candidate = output_dir / f"{stem}_{suffix}_{n:03d}{ext}"
+        if not candidate.exists():
+            return candidate
+        n += 1

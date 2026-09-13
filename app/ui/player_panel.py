@@ -83,6 +83,7 @@ class KeyframeSlider(QSlider):
 class PlayerPanel(QWidget):
     in_point_changed = Signal(object)  # float | None
     out_point_changed = Signal(object)  # float | None
+    keyframes_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -92,6 +93,7 @@ class PlayerPanel(QWidget):
         self._seeking_by_user = False
         self._latest_frame_image: QImage | None = None
         self._keyframes: list[float] | None = None
+        self._keyframe_state: str = "none"  # "none" | "loading" | "ready" | "unavailable"
 
         self._player = QMediaPlayer(self)
         self._audio_output = QAudioOutput(self)
@@ -209,8 +211,10 @@ class PlayerPanel(QWidget):
         self._in_thumb_label.clear()
         self._out_thumb_label.clear()
         self._keyframes = None
+        self._keyframe_state = "loading"
         self._slider.clear_keyframes()
         self._keyframe_status_label.setText("キーフレーム: 判定中…")
+        self.keyframes_changed.emit()
 
         self._header_label.setText(
             f"{item.path.name}  ({item.width}x{item.height}  {item.fps:.2f}fps  "
@@ -251,8 +255,10 @@ class PlayerPanel(QWidget):
 
     def _reset_keyframe_display(self) -> None:
         self._keyframes = None
+        self._keyframe_state = "none"
         self._slider.clear_keyframes()
         self._keyframe_status_label.setText("キーフレーム: -")
+        self.keyframes_changed.emit()
 
     # --------------------------------------------------------------- 操作
 
@@ -288,6 +294,30 @@ class PlayerPanel(QWidget):
         self._set_thumb(self._in_thumb_label)
         self.in_point_changed.emit(self._in_point_s)
 
+    def set_in_point_value(self, seconds: float) -> None:
+        """IN点を任意の秒数へ移動する(§8.4 のキーフレームスナップ用)。
+
+        実際にその位置までシークし、届いたフレームでサムネも更新する。
+        """
+        if self._item is None:
+            return
+        self._priming_active = False
+        self._in_point_s = max(0.0, min(seconds, self._item.duration))
+        self._update_in_out_label()
+        self.in_point_changed.emit(self._in_point_s)
+        self._player.pause()
+        self._player.setPosition(round(self._in_point_s * 1000))
+        self._capture_thumb_on_next_frame(self._in_thumb_label)
+
+    def _capture_thumb_on_next_frame(self, label: QLabel) -> None:
+        def once(frame: QVideoFrame) -> None:
+            if frame.isValid():
+                self._latest_frame_image = frame.toImage()
+                self._set_thumb(label)
+            self._video_widget.videoSink().videoFrameChanged.disconnect(once)
+
+        self._video_widget.videoSink().videoFrameChanged.connect(once)
+
     def set_out_point(self) -> None:
         if self._item is None:
             return
@@ -312,6 +342,11 @@ class PlayerPanel(QWidget):
     def keyframes(self) -> list[float] | None:
         return self._keyframes
 
+    @property
+    def keyframe_state(self) -> str:
+        """"none" | "loading" | "ready" | "unavailable" """
+        return self._keyframe_state
+
     def current_position_seconds(self) -> float:
         return self._player.position() / 1000.0
 
@@ -320,15 +355,19 @@ class PlayerPanel(QWidget):
         if self._item is None or self._item.path != path:
             return
         self._keyframes = keyframes
+        self._keyframe_state = "ready"
         self._slider.set_keyframes(keyframes)
         self._keyframe_status_label.setText(f"キーフレーム: {len(keyframes)}個")
+        self.keyframes_changed.emit()
 
     def set_keyframes_unavailable(self, path: Path) -> None:
         if self._item is None or self._item.path != path:
             return
         self._keyframes = None
+        self._keyframe_state = "unavailable"
         self._slider.clear_keyframes()
         self._keyframe_status_label.setText("キーフレーム: 判定不能")
+        self.keyframes_changed.emit()
 
     def jump_to_prev_keyframe(self) -> None:
         if self._item is None or not self._keyframes:
