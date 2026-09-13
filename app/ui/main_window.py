@@ -1,15 +1,14 @@
-"""メインウィンドウ。Phase 1: フォルダ選択 + サムネ一覧 + 選択情報パネル。"""
+"""メインウィンドウ。Phase 2: フォルダ選択 + サムネ一覧 + プレビュー再生。"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, QThreadPool, Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
-    QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -23,73 +22,13 @@ from PySide6.QtWidgets import (
 from app.core.ffmpeg_runner import find_ffmpeg, find_ffprobe
 from app.core.models import VideoItem
 from app.core.video_loader import LoadVideoWorker, scan_folder
+from app.ui.player_panel import PlayerPanel
 from app.ui.thumbnail_grid import THUMB_SIZES, ThumbnailGrid
 
 ORG_NAME = "VideoTrimmer"
 APP_NAME = "VideoTrimmer"
 SETTINGS_LAST_FOLDER = "last_folder"
 MAX_PARALLEL_LOADS = 4
-
-
-class _InfoPanel(QWidget):
-    """右ペイン上部：選択中の動画のファイル情報。プレビュー本体は Phase 2 で追加する。"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        box = QGroupBox("ファイル情報")
-        form = QFormLayout(box)
-
-        self._name = QLabel("-")
-        self._path = QLabel("-")
-        self._path.setWordWrap(True)
-        self._duration = QLabel("-")
-        self._resolution = QLabel("-")
-        self._fps = QLabel("-")
-        self._codec = QLabel("-")
-        self._size = QLabel("-")
-
-        form.addRow("ファイル名:", self._name)
-        form.addRow("パス:", self._path)
-        form.addRow("長さ:", self._duration)
-        form.addRow("解像度:", self._resolution)
-        form.addRow("fps:", self._fps)
-        form.addRow("コーデック:", self._codec)
-        form.addRow("サイズ:", self._size)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(box)
-        layout.addStretch(1)
-
-    def clear(self) -> None:
-        for label in (
-            self._name, self._path, self._duration,
-            self._resolution, self._fps, self._codec, self._size,
-        ):
-            label.setText("-")
-
-    def show_loading(self, path: Path) -> None:
-        self.clear()
-        self._name.setText(path.name)
-        self._path.setText(str(path))
-        self._duration.setText("読み込み中…")
-
-    def show_error(self, path: Path, message: str) -> None:
-        self.clear()
-        self._name.setText(path.name)
-        self._path.setText(str(path))
-        self._duration.setText("読み込み不可")
-        self._duration.setToolTip(message)
-
-    def show_video_item(self, item: VideoItem) -> None:
-        m, s = divmod(int(round(item.duration)), 60)
-        h, m = divmod(m, 60)
-        self._name.setText(item.path.name)
-        self._path.setText(str(item.path))
-        self._duration.setText(f"{h:02d}:{m:02d}:{s:02d}  ({item.duration:.3f}秒)")
-        self._resolution.setText(f"{item.width} x {item.height}")
-        self._fps.setText(f"{item.fps:.3f}")
-        self._codec.setText(f"video: {item.vcodec} / audio: {item.acodec or 'なし'}")
-        self._size.setText(f"{item.size_bytes:,} bytes")
 
 
 class MainWindow(QMainWindow):
@@ -108,6 +47,7 @@ class MainWindow(QMainWindow):
         self._ffprobe_path = find_ffprobe()
 
         self._build_ui()
+        self._setup_shortcuts()
 
         if self._ffmpeg_path is None or self._ffprobe_path is None:
             QMessageBox.warning(
@@ -146,17 +86,37 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self._size_combo)
         root_layout.addLayout(top_bar)
 
-        # 左: サムネ一覧 / 右: 情報パネル
+        # 左: サムネ一覧 / 右: プレビュー
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self._grid = ThumbnailGrid()
         self._grid.video_selected.connect(self._on_video_selected)
-        self._info_panel = _InfoPanel()
+        self._player_panel = PlayerPanel()
 
         splitter.addWidget(self._grid)
-        splitter.addWidget(self._info_panel)
+        splitter.addWidget(self._player_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         root_layout.addWidget(splitter, 1)
+
+    def _setup_shortcuts(self) -> None:
+        # 仕様書 §5.3 のキーボードショートカット。
+        # フォーカスがサムネ一覧（QListView）にあっても常に効くよう ApplicationShortcut にする。
+        def bind(key: str, slot) -> None:
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(slot)
+
+        bind("Space", self._player_panel.toggle_play_pause)
+        bind("Left", lambda: self._player_panel.step_frame(-1))
+        bind("Right", lambda: self._player_panel.step_frame(1))
+        bind("Shift+Left", lambda: self._player_panel.step_seconds(-1))
+        bind("Shift+Right", lambda: self._player_panel.step_seconds(1))
+        bind("Ctrl+Left", lambda: self._player_panel.step_seconds(-10))
+        bind("Ctrl+Right", lambda: self._player_panel.step_seconds(10))
+        bind("I", self._player_panel.set_in_point)
+        bind("O", self._player_panel.set_out_point)
+        # ",". "." でのキーフレームジャンプは Phase 2.5 で実装する
+        # Enter での実行は、抜き出し/削除タブが揃う Phase 3/4 で実装する
 
     # ------------------------------------------------------------- フォルダ
 
@@ -182,7 +142,7 @@ class MainWindow(QMainWindow):
         self._path_label.setText(str(folder))
         self._settings.setValue(SETTINGS_LAST_FOLDER, str(folder))
         self._grid.clear()
-        self._info_panel.clear()
+        self._player_panel.clear()
 
         try:
             files = scan_folder(folder)
@@ -226,10 +186,10 @@ class MainWindow(QMainWindow):
         if status == "ready":
             item = self._grid.get_video_item(path)
             if item is not None:
-                self._info_panel.show_video_item(item)
+                self._player_panel.load_video(item)
             return
         if status == "error":
             message = self._grid.get_error_message(path) or ""
-            self._info_panel.show_error(path, message)
+            self._player_panel.show_error(path, message)
             return
-        self._info_panel.show_loading(path)
+        self._player_panel.show_loading(path)

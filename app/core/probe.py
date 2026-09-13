@@ -38,7 +38,8 @@ def probe_video(path: Path, ffprobe_path: Path) -> VideoItem:
         str(path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # ffprobe の出力は常に UTF-8。Windows のロケール(cp932等)に引きずられないよう明示する。
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     except OSError as exc:
         raise ProbeError(f"ffprobe の実行に失敗しました: {exc}") from exc
 
