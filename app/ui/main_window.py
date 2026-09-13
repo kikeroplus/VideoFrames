@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.ffmpeg_runner import find_ffmpeg, find_ffprobe
+from app.core.keyframes import KeyframeWorker
 from app.core.models import VideoItem
 from app.core.video_loader import LoadVideoWorker, scan_folder
 from app.ui.player_panel import PlayerPanel
@@ -115,7 +116,8 @@ class MainWindow(QMainWindow):
         bind("Ctrl+Right", lambda: self._player_panel.step_seconds(10))
         bind("I", self._player_panel.set_in_point)
         bind("O", self._player_panel.set_out_point)
-        # ",". "." でのキーフレームジャンプは Phase 2.5 で実装する
+        bind(",", self._player_panel.jump_to_prev_keyframe)
+        bind(".", self._player_panel.jump_to_next_keyframe)
         # Enter での実行は、抜き出し/削除タブが揃う Phase 3/4 で実装する
 
     # ------------------------------------------------------------- フォルダ
@@ -187,9 +189,27 @@ class MainWindow(QMainWindow):
             item = self._grid.get_video_item(path)
             if item is not None:
                 self._player_panel.load_video(item)
+                self._start_keyframe_fetch(item)
             return
         if status == "error":
             message = self._grid.get_error_message(path) or ""
             self._player_panel.show_error(path, message)
             return
         self._player_panel.show_loading(path)
+
+    # ----------------------------------------------------------- キーフレーム
+
+    def _start_keyframe_fetch(self, item: VideoItem) -> None:
+        if self._ffprobe_path is None:
+            self._player_panel.set_keyframes_unavailable(item.path)
+            return
+        worker = KeyframeWorker(item.path, self._ffprobe_path)
+        worker.signals.loaded.connect(self._on_keyframes_loaded)
+        worker.signals.failed.connect(self._on_keyframes_failed)
+        self._pool.start(worker)
+
+    def _on_keyframes_loaded(self, path: Path, keyframes: list) -> None:
+        self._player_panel.set_keyframes(path, keyframes)
+
+    def _on_keyframes_failed(self, path: Path, message: str) -> None:
+        self._player_panel.set_keyframes_unavailable(path)

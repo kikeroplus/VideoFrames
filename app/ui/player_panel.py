@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, QUrl, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -19,11 +19,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
 )
 from PySide6.QtCore import Qt
 
+from app.core.keyframes import next_keyframe, prev_keyframe
 from app.core.models import VideoItem
 from app.utils.timecode import seconds_to_frame, seconds_to_timecode
 
@@ -38,6 +41,45 @@ IN_OUT_THUMB_SIZE = (96, 54)  # 幅, 高さ(px)
 PRIME_DURATION_MS = 120
 
 
+class KeyframeSlider(QSlider):
+    """シークバー。キーフレーム位置を細い縦線で描画する（仕様書 §8.4）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._keyframe_positions_ms: list[int] = []
+
+    def set_keyframes(self, keyframes_s: list[float]) -> None:
+        self._keyframe_positions_ms = [round(k * 1000) for k in keyframes_s]
+        self.update()
+
+    def clear_keyframes(self) -> None:
+        self._keyframe_positions_ms = []
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._keyframe_positions_ms or self.maximum() <= self.minimum():
+            return
+
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, option, QStyle.SubControl.SC_SliderGroove, self
+        )
+        span = max(1, groove_rect.width())
+
+        painter = QPainter(self)
+        painter.setPen(QPen(Qt.GlobalColor.darkYellow, 1))
+        for pos_ms in self._keyframe_positions_ms:
+            if pos_ms < self.minimum() or pos_ms > self.maximum():
+                continue
+            x = groove_rect.x() + QStyle.sliderPositionFromValue(
+                self.minimum(), self.maximum(), pos_ms, span, option.upsideDown
+            )
+            painter.drawLine(x, groove_rect.y(), x, groove_rect.y() + groove_rect.height())
+        painter.end()
+
+
 class PlayerPanel(QWidget):
     in_point_changed = Signal(object)  # float | None
     out_point_changed = Signal(object)  # float | None
@@ -49,6 +91,7 @@ class PlayerPanel(QWidget):
         self._out_point_s: float | None = None
         self._seeking_by_user = False
         self._latest_frame_image: QImage | None = None
+        self._keyframes: list[float] | None = None
 
         self._player = QMediaPlayer(self)
         self._audio_output = QAudioOutput(self)
@@ -63,7 +106,7 @@ class PlayerPanel(QWidget):
         self._header_label.setStyleSheet("color: palette(mid);")
         self._header_label.setWordWrap(True)
 
-        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider = KeyframeSlider()
         self._slider.setRange(0, 0)
         self._slider.sliderMoved.connect(self._on_slider_moved)
         self._slider.sliderPressed.connect(self._on_slider_pressed)
@@ -86,6 +129,9 @@ class PlayerPanel(QWidget):
         self._frame_fwd_button = QPushButton("コマ▶")
         self._frame_back_button.clicked.connect(lambda: self.step_frame(-1))
         self._frame_fwd_button.clicked.connect(lambda: self.step_frame(1))
+
+        self._keyframe_status_label = QLabel("キーフレーム: -")
+        self._keyframe_status_label.setStyleSheet("color: palette(mid);")
 
         self._in_button = QPushButton("IN設定")
         self._out_button = QPushButton("OUT設定")
@@ -112,6 +158,7 @@ class PlayerPanel(QWidget):
         frame_row.addWidget(self._frame_back_button)
         frame_row.addWidget(self._frame_fwd_button)
         frame_row.addStretch(1)
+        frame_row.addWidget(self._keyframe_status_label)
 
         in_out_row = QHBoxLayout()
         in_out_row.addWidget(self._in_thumb_label)
@@ -139,6 +186,7 @@ class PlayerPanel(QWidget):
         layout.addLayout(in_out_row)
 
         self._pending_prime = False
+        self._priming_active = False
 
         self._player.positionChanged.connect(self._on_position_changed)
         self._player.durationChanged.connect(self._on_duration_changed)
@@ -160,6 +208,9 @@ class PlayerPanel(QWidget):
         self._update_in_out_label()
         self._in_thumb_label.clear()
         self._out_thumb_label.clear()
+        self._keyframes = None
+        self._slider.clear_keyframes()
+        self._keyframe_status_label.setText("キーフレーム: 判定中…")
 
         self._header_label.setText(
             f"{item.path.name}  ({item.width}x{item.height}  {item.fps:.2f}fps  "
@@ -178,6 +229,7 @@ class PlayerPanel(QWidget):
         self._player.setSource(QUrl())
         self._header_label.setText(f"{path.name}  読み込み中…")
         self._set_controls_enabled(False)
+        self._reset_keyframe_display()
 
     def show_error(self, path: Path, message: str) -> None:
         self._item = None
@@ -186,6 +238,7 @@ class PlayerPanel(QWidget):
         self._player.setSource(QUrl())
         self._header_label.setText(f"{path.name}  読み込み不可: {message}")
         self._set_controls_enabled(False)
+        self._reset_keyframe_display()
 
     def clear(self) -> None:
         self._item = None
@@ -194,6 +247,12 @@ class PlayerPanel(QWidget):
         self._player.setSource(QUrl())
         self._header_label.setText("動画を選択してください")
         self._set_controls_enabled(False)
+        self._reset_keyframe_display()
+
+    def _reset_keyframe_display(self) -> None:
+        self._keyframes = None
+        self._slider.clear_keyframes()
+        self._keyframe_status_label.setText("キーフレーム: -")
 
     # --------------------------------------------------------------- 操作
 
@@ -208,6 +267,7 @@ class PlayerPanel(QWidget):
     def step_frame(self, delta: int) -> None:
         if self._item is None or self._item.fps <= 0:
             return
+        self._priming_active = False
         self._player.pause()
         frame_ms = 1000.0 / self._item.fps
         new_ms = max(0, round(self._player.position() + delta * frame_ms))
@@ -216,6 +276,7 @@ class PlayerPanel(QWidget):
     def step_seconds(self, delta: float) -> None:
         if self._item is None:
             return
+        self._priming_active = False
         new_ms = max(0, round(self._player.position() + delta * 1000))
         self._player.setPosition(new_ms)
 
@@ -247,8 +308,45 @@ class PlayerPanel(QWidget):
     def current_item(self) -> VideoItem | None:
         return self._item
 
+    @property
+    def keyframes(self) -> list[float] | None:
+        return self._keyframes
+
     def current_position_seconds(self) -> float:
         return self._player.position() / 1000.0
+
+    def set_keyframes(self, path: Path, keyframes: list[float]) -> None:
+        """path が現在選択中の動画と一致する場合のみ、キーフレーム情報を反映する。"""
+        if self._item is None or self._item.path != path:
+            return
+        self._keyframes = keyframes
+        self._slider.set_keyframes(keyframes)
+        self._keyframe_status_label.setText(f"キーフレーム: {len(keyframes)}個")
+
+    def set_keyframes_unavailable(self, path: Path) -> None:
+        if self._item is None or self._item.path != path:
+            return
+        self._keyframes = None
+        self._slider.clear_keyframes()
+        self._keyframe_status_label.setText("キーフレーム: 判定不能")
+
+    def jump_to_prev_keyframe(self) -> None:
+        if self._item is None or not self._keyframes:
+            return
+        target = prev_keyframe(self.current_position_seconds(), self._keyframes)
+        if target is not None:
+            self._priming_active = False
+            self._player.pause()
+            self._player.setPosition(round(target * 1000))
+
+    def jump_to_next_keyframe(self) -> None:
+        if self._item is None or not self._keyframes:
+            return
+        target = next_keyframe(self.current_position_seconds(), self._keyframes)
+        if target is not None:
+            self._priming_active = False
+            self._player.pause()
+            self._player.setPosition(round(target * 1000))
 
     # -------------------------------------------------------------- 内部
 
@@ -330,11 +428,17 @@ class PlayerPanel(QWidget):
     def _prime_video_pipeline(self) -> None:
         was_muted = self._audio_output.isMuted()
         self._audio_output.setMuted(True)
+        self._priming_active = True
         self._player.play()
 
         def finish_priming() -> None:
             self._player.pause()
-            self._player.setPosition(0)
+            # プライミング中にユーザー操作(シーク等)が入っていた場合は
+            # 0への巻き戻しで上書きしない(各シーク操作が _priming_active を
+            # False にする)。
+            if self._priming_active:
+                self._player.setPosition(0)
+            self._priming_active = False
             self._audio_output.setMuted(was_muted)
 
         QTimer.singleShot(PRIME_DURATION_MS, finish_priming)
@@ -343,6 +447,7 @@ class PlayerPanel(QWidget):
         self._seeking_by_user = True
 
     def _on_slider_moved(self, position_ms: int) -> None:
+        self._priming_active = False
         self._player.setPosition(position_ms)
 
     def _on_slider_released(self) -> None:

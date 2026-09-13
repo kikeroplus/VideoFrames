@@ -2,23 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 from pathlib import Path
 
+from app.utils.paths import cache_key_for
+
 CACHE_DIR = Path(os.environ["LOCALAPPDATA"]) / "VideoTrimmer" / "thumbs"
 
 
-def _cache_key(path: Path) -> str:
-    """絶対パス + mtime + サイズ から短いハッシュを作る（ファイル更新で自動的に変わる）。"""
-    st = path.stat()
-    raw = f"{path.resolve()}|{st.st_mtime}|{st.st_size}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-
 def cache_path_for(path: Path) -> Path:
-    return CACHE_DIR / f"{_cache_key(path)}.jpg"
+    return CACHE_DIR / f"{cache_key_for(path)}.jpg"
 
 
 def get_or_create_thumbnail(path: Path, duration: float, ffmpeg_path: Path) -> Path | None:
