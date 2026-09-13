@@ -468,7 +468,12 @@ class MainWindow(QMainWindow):
 
     def _show_toast(self, message: str, action_text: str | None = None, on_action=None) -> None:
         if self._current_toast is not None:
-            self._current_toast.close()
+            # 直前のトーストは自動タイマーや×ボタンで既にC++側が破棄されている
+            # ことがある(WA_DeleteOnClose)。その場合 close() は例外になるため無視する。
+            try:
+                self._current_toast.close()
+            except RuntimeError:
+                pass
         self._current_toast = Toast(self, message, action_text=action_text, on_action=on_action)
 
     def _write_error_log(self, operation_label: str, message: str) -> Path | None:
