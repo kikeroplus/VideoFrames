@@ -1,7 +1,8 @@
 """VideoTrimmer エントリポイント。
 
-Phase 0 時点では GUI はまだ実装しておらず、CLI として
-動画1本のメタ情報を表示するだけの動作確認用スクリプト。
+引数なしで実行すると GUI (MainWindow) を起動する。
+引数に動画ファイルパスを1つ渡すと、Phase 0 から残している
+CLI 動作確認モード（ffprobe でメタ情報を表示するだけ）で動く。
 """
 
 from __future__ import annotations
@@ -13,12 +14,19 @@ from app.core.ffmpeg_runner import find_ffmpeg, find_ffprobe
 from app.core.probe import ProbeError, probe_video
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(f"使い方: python {Path(argv[0]).name} <動画ファイルパス>")
-        return 1
+def run_gui() -> int:
+    from PySide6.QtWidgets import QApplication
 
-    video_path = Path(argv[1])
+    from app.ui.main_window import MainWindow
+
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+def probe_cli(video_path_str: str) -> int:
+    video_path = Path(video_path_str)
     if not video_path.is_file():
         print(f"ファイルが見つかりません: {video_path}")
         return 1
@@ -49,6 +57,16 @@ def main(argv: list[str]) -> int:
     print(f"acodec     : {item.acodec or '(なし)'}")
     print(f"size       : {item.size_bytes:,} bytes")
     return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 1:
+        return run_gui()
+    if len(argv) == 2:
+        return probe_cli(argv[1])
+
+    print(f"使い方: python {Path(argv[0]).name} [動画ファイルパス]")
+    return 1
 
 
 if __name__ == "__main__":
