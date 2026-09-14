@@ -284,6 +284,21 @@ class ExtractPanel(QWidget):
         self._pending_request = None
 
     def _revalidate(self) -> None:
+        """現在のIN/OUT設定を検証して _pending_request を更新したうえで、
+        抜き出しポイントリストに登録があれば実行ボタンを補助的に有効化する。
+        """
+        self._revalidate_current()
+        if self._has_registered_points and self._pending_request is None:
+            # 現在のIN/OUTは無効だが、抜き出しポイントリストに登録があるので
+            # そちらを使って実行できる(main_window 側が実行時にリストを優先する)。
+            self._reason_label.setText("")
+            self._cut_status_label.setText("登録済みの抜き出しポイント一覧を使って実行します。")
+            self._snap_prev_button.setVisible(False)
+            self._snap_next_button.setVisible(False)
+            self._execute_button.setEnabled(True)
+
+    def _revalidate_current(self) -> None:
+        """現在のIN/OUT設定のみに基づいて _pending_request を計算する。"""
         item = self._player_panel.current_item
         in_s = self._player_panel.in_point
 
@@ -299,19 +314,6 @@ class ExtractPanel(QWidget):
             self._cut_status_label.setText("")
             self._snap_prev_button.setVisible(False)
             self._snap_next_button.setVisible(False)
-            return
-
-        if self._has_registered_points:
-            # 現在のIN/OUTの状態(未設定・片方だけ設定済み等)に関わらず、抜き出し
-            # ポイントリストに登録があればそちらを使って実行できる
-            # (main_window 側が実行時にリストを優先するため、以降の現在値の
-            # 検証はスキップしてよい)。
-            self._reason_label.setText("")
-            self._cut_status_label.setText("登録済みの抜き出しポイント一覧を使って実行します。")
-            self._snap_prev_button.setVisible(False)
-            self._snap_next_button.setVisible(False)
-            self._execute_button.setEnabled(True)
-            self._pending_request = None
             return
 
         if in_s is None:
