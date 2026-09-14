@@ -9,12 +9,14 @@ IN/OUT点の設定はここで受け付けるが、抜き出し/削除タブ（P
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QTimer, QUrl, Signal
 from PySide6.QtGui import QImage, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -26,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
-from app.core.keyframes import next_keyframe, prev_keyframe
+from app.core.keyframes import nearest_keyframe, next_keyframe, prev_keyframe
 from app.core.models import VideoItem
 from app.utils.timecode import seconds_to_frame, seconds_to_timecode
 
@@ -39,6 +41,10 @@ IN_OUT_THUMB_SIZE = (96, 54)  # 幅, 高さ(px)
 # 初期化する(「プライミング」)ことで、以後は再生なしのシークでも
 # 正しく映像・サムネイルが得られるようにする。
 PRIME_DURATION_MS = 120
+
+# OUT点のサムネイル取得のためにシークする際、動画末尾ぴったりへのシークだと
+# フレームが更新されない場合があるため、末尾からこの分だけ手前を狙う。
+THUMB_END_SEEK_MARGIN_MS = 200
 
 
 class KeyframeSlider(QSlider):
@@ -115,12 +121,15 @@ class PlayerPanel(QWidget):
     out_point_changed = Signal(object)  # float | None
     keyframes_changed = Signal()
     video_changed = Signal()  # 選択中の動画が切り替わった(読込/読込中/エラー/クリアの全パターン)
+    register_requested = Signal()  # 「登録」ボタン: 現在のIN/OUTを抜き出しポイントリストへ追加
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._item: VideoItem | None = None
         self._in_point_s: float | None = None
         self._out_point_s: float | None = None
+        self._in_locked = False  # 削除タブの冒頭から/末尾までモードなど、外部からの一時的な操作禁止
+        self._out_locked = False
         self._seeking_by_user = False
         self._latest_frame_image: QImage | None = None
         self._keyframes: list[float] | None = None
@@ -166,6 +175,12 @@ class PlayerPanel(QWidget):
         self._keyframe_status_label = QLabel("キーフレーム: -")
         self._keyframe_status_label.setStyleSheet("color: palette(mid);")
 
+        self._force_keyframe_checkbox = QCheckBox("IN/OUT設定をキーフレームに強制的に揃える")
+        self._force_keyframe_checkbox.setToolTip(
+            "オンの場合、「IN設定」/「OUT設定」ボタン(Iキー/Oキー)を押した時点で、\n"
+            "現在位置ではなく最も近いキーフレームの位置を採用する。"
+        )
+
         self._in_button = QPushButton("IN設定")
         self._out_button = QPushButton("OUT設定")
         for button in (self._in_button, self._out_button):
@@ -181,11 +196,19 @@ class PlayerPanel(QWidget):
         self._in_text_label = QLabel("IN: -")
         self._out_text_label = QLabel("OUT: -")
 
+        self._in_out_length_label = QLabel("長さ: -")
+        self._in_out_length_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self._preview_button = QPushButton("▶ IN-OUT再生")
         self._preview_button.setEnabled(False)
         self._preview_button.clicked.connect(self.toggle_preview_in_out)
         self._previewing = False
         self._preview_watcher = None
+
+        self._register_button = QPushButton("登録")
+        self._register_button.setEnabled(False)
+        self._register_button.setToolTip("現在のIN/OUTを抜き出しポイントリストに追加する")
+        self._register_button.clicked.connect(self.register_requested.emit)
 
         controls_row = QHBoxLayout()
         controls_row.addWidget(self._back10_button)
@@ -199,6 +222,7 @@ class PlayerPanel(QWidget):
         frame_row.addWidget(self._frame_back_button)
         frame_row.addWidget(self._frame_fwd_button)
         frame_row.addStretch(1)
+        frame_row.addWidget(self._force_keyframe_checkbox)
         frame_row.addWidget(self._keyframe_status_label)
 
         in_out_row = QHBoxLayout()
@@ -210,8 +234,12 @@ class PlayerPanel(QWidget):
         in_out_row.addLayout(in_col)
         in_out_row.setAlignment(in_col, Qt.AlignmentFlag.AlignBottom)
         in_out_row.addStretch(1)
-        in_out_row.addWidget(self._preview_button)
-        in_out_row.setAlignment(self._preview_button, Qt.AlignmentFlag.AlignBottom)
+        preview_col = QVBoxLayout()
+        preview_col.addWidget(self._in_out_length_label)
+        preview_col.addWidget(self._preview_button)
+        preview_col.addWidget(self._register_button)
+        in_out_row.addLayout(preview_col)
+        in_out_row.setAlignment(preview_col, Qt.AlignmentFlag.AlignBottom)
         in_out_row.addStretch(1)
         in_out_row.addWidget(self._out_thumb_label)
         in_out_row.setAlignment(self._out_thumb_label, Qt.AlignmentFlag.AlignBottom)
@@ -340,9 +368,17 @@ class PlayerPanel(QWidget):
         self._player.setPosition(new_ms)
 
     def set_in_point(self) -> None:
-        if self._item is None:
+        if self._item is None or self._in_locked:
             return
-        self._in_point_s = self._player.position() / 1000.0
+        position_s = self._player.position() / 1000.0
+        if self._force_keyframe_checkbox.isChecked() and self._keyframes:
+            snapped = nearest_keyframe(position_s, self._keyframes)
+            if snapped is not None:
+                # キーフレーム位置まで実際にシークしてサムネも取り直す
+                # (見た目の再生位置とIN点の値を一致させる)。
+                self.set_in_point_value(snapped)
+                return
+        self._in_point_s = position_s
         self._update_in_out_label()
         self._set_thumb(self._in_thumb_label)
         self.in_point_changed.emit(self._in_point_s)
@@ -360,8 +396,7 @@ class PlayerPanel(QWidget):
         self._update_in_out_label()
         self.in_point_changed.emit(self._in_point_s)
         self._player.pause()
-        self._player.setPosition(round(self._in_point_s * 1000))
-        self._capture_thumb_on_next_frame(self._in_thumb_label)
+        self._seek_and_capture_thumb(round(self._in_point_s * 1000), self._in_thumb_label)
 
     def _capture_thumb_on_next_frame(self, label: QLabel) -> None:
         def once(frame: QVideoFrame) -> None:
@@ -372,13 +407,140 @@ class PlayerPanel(QWidget):
 
         self._video_widget.videoSink().videoFrameChanged.connect(once)
 
-    def set_out_point(self) -> None:
+    def _seek_and_capture_thumb(self, position_ms: int, label: QLabel) -> None:
+        """指定位置へシークし、届いたフレームでサムネを更新する。
+
+        既にその位置にいる場合は setPosition() が新しいフレームイベントを発火せず、
+        _capture_thumb_on_next_frame() が永遠に待ち続けてサムネが古いまま(または
+        空のまま)になってしまう。冒頭から/末尾までモードの切り替え時など、IN/OUT点が
+        既に固定値になっている状態で再度同じ値をセットするケースがこれに当たるため、
+        その場合は現在保持しているフレームをそのまま反映する。
+        """
+        if self._player.position() == position_ms:
+            self._set_thumb(label)
+        else:
+            self._player.setPosition(position_ms)
+            self._capture_thumb_on_next_frame(label)
+
+    def capture_thumbnail_at(self, seconds: float, callback: Callable[[QPixmap | None], None]) -> None:
+        """指定した時刻のフレームを取得してコールバックに渡す。
+
+        IN/OUT点の状態やサムネイル表示は変更しない(抜き出しポイントリストの
+        サムネイル再取得など、既存のIN/OUTとは無関係に任意の時刻のフレームが
+        必要な場合に使う)。動画が読み込まれていない場合は None を渡す。
+        """
         if self._item is None:
+            callback(None)
             return
-        self._out_point_s = self._player.position() / 1000.0
+
+        target_ms = round(max(0.0, min(seconds, self._item.duration)) * 1000)
+
+        def deliver() -> None:
+            if self._latest_frame_image is None:
+                callback(None)
+            else:
+                callback(QPixmap.fromImage(self._latest_frame_image))
+
+        self._cancel_preview_watch()
+        self._priming_active = False
+        self._player.pause()
+
+        if self._player.position() == target_ms:
+            deliver()
+            return
+
+        def once(frame: QVideoFrame) -> None:
+            if frame.isValid():
+                self._latest_frame_image = frame.toImage()
+            self._video_widget.videoSink().videoFrameChanged.disconnect(once)
+            deliver()
+
+        self._video_widget.videoSink().videoFrameChanged.connect(once)
+        self._player.setPosition(target_ms)
+
+    def set_out_point(self) -> None:
+        if self._item is None or self._out_locked:
+            return
+        position_s = self._player.position() / 1000.0
+        if self._force_keyframe_checkbox.isChecked() and self._keyframes:
+            snapped = nearest_keyframe(position_s, self._keyframes)
+            if snapped is not None:
+                self.set_out_point_value(snapped)
+                return
+        self._out_point_s = position_s
         self._update_in_out_label()
         self._set_thumb(self._out_thumb_label)
         self.out_point_changed.emit(self._out_point_s)
+
+    def set_in_point_locked(self, locked: bool) -> None:
+        """外部(削除タブの冒頭から/末尾までモードなど)からIN点操作を一時的に禁止する。
+
+        「IN設定」ボタンとIN表示をグレーアウトし、set_in_point()(ボタン/Iキー)を
+        無効化する。set_in_point_value() による明示的な値の設定には影響しない。
+        """
+        self._in_locked = locked
+        self._in_button.setEnabled(not locked and self._item is not None)
+        self._in_text_label.setEnabled(not locked)
+
+    def set_out_point_locked(self, locked: bool) -> None:
+        """set_in_point_locked() のOUT点版。"""
+        self._out_locked = locked
+        self._out_button.setEnabled(not locked and self._item is not None)
+        self._out_text_label.setEnabled(not locked)
+
+    def set_out_point_value(self, seconds: float) -> None:
+        """OUT点を任意の秒数へ移動する(§8.4 のキーフレームスナップ用)。
+
+        実際にその位置までシークし、届いたフレームでサムネも更新する。
+        """
+        if self._item is None:
+            return
+        self._cancel_preview_watch()
+        self._priming_active = False
+        self._out_point_s = max(0.0, min(seconds, self._item.duration))
+        self._update_in_out_label()
+        self.out_point_changed.emit(self._out_point_s)
+        self._player.pause()
+        target_ms = round(self._out_point_s * 1000)
+        duration_ms = round(self._item.duration * 1000)
+        # 動画末尾ぴったり(またはその近辺)へのシークは、バックエンドが
+        # EndOfMedia扱いにしてしまい新しいフレームが届かないことがある
+        # (末尾までモードでOUT点を動画末尾に固定する際など)。サムネイル
+        # 取得用のシーク位置だけ、末尾から少し手前にずらして確実にフレーム
+        # を取得する(OUT点の値自体・カット処理には影響しない)。
+        seek_ms = min(target_ms, max(0, duration_ms - THUMB_END_SEEK_MARGIN_MS))
+        self._seek_and_capture_thumb(seek_ms, self._out_thumb_label)
+
+    def load_in_out(self, in_s: float, out_s: float) -> None:
+        """IN/OUT点をまとめて設定する(抜き出しポイントリストの選択時など)。
+
+        set_in_point_value()/set_out_point_value() を単純に連続で呼ぶと、2つの
+        シーク要求がほぼ同時に発行されてしまい、先に出したOUT側のサムネイル取得が
+        後から出したIN側のフレーム到着イベントに反応して誤ったフレームを捉えて
+        しまう(1回のフレーム到着で両方のコールバックが同時に発火するため)。
+        ここではOUT→INの順で、前のキャプチャが完了するのを待ってから次のシークを
+        出す(直列化する)ことでこれを防ぐ。最終的な再生位置はIN(区間の先頭)になる。
+        """
+        if self._item is None:
+            return
+        self._out_point_s = max(0.0, min(out_s, self._item.duration))
+        self._in_point_s = max(0.0, min(in_s, self._item.duration))
+        self._update_in_out_label()
+        self.out_point_changed.emit(self._out_point_s)
+        self.in_point_changed.emit(self._in_point_s)
+
+        duration_ms = round(self._item.duration * 1000)
+        out_target_ms = round(self._out_point_s * 1000)
+        out_seek_s = min(out_target_ms, max(0, duration_ms - THUMB_END_SEEK_MARGIN_MS)) / 1000.0
+
+        def after_in(_pixmap: QPixmap | None) -> None:
+            self._set_thumb(self._in_thumb_label)
+
+        def after_out(_pixmap: QPixmap | None) -> None:
+            self._set_thumb(self._out_thumb_label)
+            self.capture_thumbnail_at(self._in_point_s, after_in)
+
+        self.capture_thumbnail_at(out_seek_s, after_out)
 
     @property
     def in_point(self) -> float | None:
@@ -400,6 +562,15 @@ class PlayerPanel(QWidget):
     def keyframe_state(self) -> str:
         """"none" | "loading" | "ready" | "unavailable" """
         return self._keyframe_state
+
+    def current_in_out_pixmaps(self) -> tuple[QPixmap | None, QPixmap | None]:
+        """現在表示中のIN/OUTサムネイルの複製を返す(抜き出しポイントリストへの登録用)。"""
+        in_pixmap = self._in_thumb_label.pixmap()
+        out_pixmap = self._out_thumb_label.pixmap()
+        return (
+            None if in_pixmap is None or in_pixmap.isNull() else QPixmap(in_pixmap),
+            None if out_pixmap is None or out_pixmap.isNull() else QPixmap(out_pixmap),
+        )
 
     def current_position_seconds(self) -> float:
         return self._player.position() / 1000.0
@@ -530,9 +701,12 @@ class PlayerPanel(QWidget):
             self._back10_button, self._back1_button, self._play_button,
             self._fwd1_button, self._fwd10_button,
             self._frame_back_button, self._frame_fwd_button,
-            self._in_button, self._out_button,
         ):
             widget.setEnabled(enabled)
+        # IN/OUTボタンはロック中(set_in_point_locked/set_out_point_locked)なら
+        # 動画の読込状態に関わらず無効のままにする。
+        self._in_button.setEnabled(enabled and not self._in_locked)
+        self._out_button.setEnabled(enabled and not self._out_locked)
         if not enabled:
             # プレビューボタンは IN/OUT が両方揃った時だけ有効化する
             # (_update_in_out_label 側で管理)。無効化のみここで反映する。
@@ -548,7 +722,13 @@ class PlayerPanel(QWidget):
             and self._out_point_s is not None
             and self._out_point_s > self._in_point_s
         )
+        if valid_range:
+            length_s = self._out_point_s - self._in_point_s
+            self._in_out_length_label.setText(f"長さ: {seconds_to_timecode(length_s)}")
+        else:
+            self._in_out_length_label.setText("長さ: -")
         self._preview_button.setEnabled(valid_range)
+        self._register_button.setEnabled(valid_range)
         if not valid_range:
             self._cancel_preview_watch()
 

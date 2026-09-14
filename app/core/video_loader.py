@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Signal
@@ -41,13 +42,40 @@ class LoadVideoWorker(QRunnable):
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
         self.signals = LoadSignals()
+        self._process: subprocess.Popen | None = None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """呼び出し側(GUIスレッド)から呼ぶ。実行中の ffprobe/ffmpeg を直ちに終了させる。
+
+        QThreadPool.clear() は未着手タスクの取消のみで、既に実行中のワーカーは
+        最後まで動き続けてしまう(結果は世代チェックで捨てられるだけでプロセスは
+        止まらない)ため、フォルダ切り替え・アプリ終了時にはこちらを呼ぶ必要がある。
+        """
+        self._cancelled = True
+        if self._process is not None:
+            try:
+                self._process.terminate()
+            except OSError:
+                pass
 
     def run(self) -> None:
+        def set_process(p: subprocess.Popen | None) -> None:
+            self._process = p
+
         try:
-            item = probe_video(self.path, self.ffprobe_path)
+            item = probe_video(self.path, self.ffprobe_path, set_process=set_process)
         except ProbeError as exc:
-            self.signals.failed.emit(self.generation, self.path, str(exc))
+            if not self._cancelled:
+                self.signals.failed.emit(self.generation, self.path, str(exc))
             return
 
-        item.thumb_path = get_or_create_thumbnail(self.path, item.duration, self.ffmpeg_path)
+        if self._cancelled:
+            return
+
+        item.thumb_path = get_or_create_thumbnail(
+            self.path, item.duration, self.ffmpeg_path, set_process=set_process,
+        )
+        if self._cancelled:
+            return
         self.signals.loaded.emit(self.generation, self.path, item)

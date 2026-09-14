@@ -42,7 +42,10 @@ class ThumbnailGrid(QListView):
         self._model = QStandardItemModel(self)
         self.setModel(self._model)
         self.setViewMode(QListView.ViewMode.IconMode)
-        self.setResizeMode(QListView.ResizeMode.Adjust)
+        # 常に1列固定で縦に並べる(ウィンドウ幅が変わっても列数は変化させない)。
+        self.setFlow(QListView.Flow.TopToBottom)
+        self.setWrapping(False)
+        self.setResizeMode(QListView.ResizeMode.Fixed)
         self.setMovement(QListView.Movement.Static)
         self.setUniformItemSizes(True)
         self.setSpacing(8)
@@ -60,7 +63,11 @@ class ThumbnailGrid(QListView):
     def _apply_grid_size(self) -> None:
         icon_h = max(1, int(self._thumb_size * 9 / 16))
         self.setIconSize(QSize(self._thumb_size, icon_h))
-        self.setGridSize(QSize(self._thumb_size + 16, icon_h + 56))
+        cell_width = self._thumb_size + 16
+        self.setGridSize(QSize(cell_width, icon_h + 56))
+        # 1列固定にした分、この一覧自体の幅も固定する(スプリッタでドラッグしても
+        # 変化しない)。縦スクロールバー分の余白を含めておく。
+        self.setFixedWidth(cell_width + self.verticalScrollBar().sizeHint().width() + 8)
 
     def clear(self) -> None:
         self._model.clear()
@@ -80,6 +87,17 @@ class ThumbnailGrid(QListView):
             if item.data(PATH_ROLE) == path:
                 return item
         return None
+
+    def select_path(self, path: Path) -> bool:
+        """指定パスの項目を選択状態にする(プロジェクト読込時の復元用)。
+
+        見つからない場合は何もせず False を返す。
+        """
+        item = self._find_item(path)
+        if item is None:
+            return False
+        self.setCurrentIndex(self._model.indexFromItem(item))
+        return True
 
     def update_loaded(self, path: Path, video_item: VideoItem) -> None:
         item = self._find_item(path)

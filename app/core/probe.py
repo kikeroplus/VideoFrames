@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from app.core.models import VideoItem
-from app.utils.subprocess_flags import hidden_subprocess_kwargs
+from app.utils.subprocess_flags import assign_to_job, hidden_subprocess_kwargs
 
 
 class ProbeError(Exception):
@@ -25,10 +26,16 @@ def _parse_frame_rate(rate_str: str) -> float:
     return float(rate_str)
 
 
-def probe_video(path: Path, ffprobe_path: Path) -> VideoItem:
+def probe_video(
+    path: Path,
+    ffprobe_path: Path,
+    set_process: Callable[[subprocess.Popen | None], None] | None = None,
+) -> VideoItem:
     """ffprobe を実行し、動画1本のメタ情報を VideoItem として返す。
 
     映像ストリームが見つからない場合や ffprobe が失敗した場合は ProbeError を送出する。
+    set_process を渡すと、起動した Popen を呼び出し側(ワーカー)に通知する。呼び出し側は
+    これを保持しておき、フォルダ切り替え等で不要になった際に terminate() でキャンセルできる。
     """
     cmd = [
         str(ffprobe_path),
@@ -40,18 +47,25 @@ def probe_video(path: Path, ffprobe_path: Path) -> VideoItem:
     ]
     try:
         # ffprobe の出力は常に UTF-8。Windows のロケール(cp932等)に引きずられないよう明示する。
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8",
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
             **hidden_subprocess_kwargs(),
         )
     except OSError as exc:
         raise ProbeError(f"ffprobe の実行に失敗しました: {exc}") from exc
 
-    if result.returncode != 0:
-        raise ProbeError(f"ffprobe がエラー終了しました ({path}): {result.stderr.strip()}")
+    assign_to_job(process)
+    if set_process is not None:
+        set_process(process)
+    stdout, stderr = process.communicate()
+    if set_process is not None:
+        set_process(None)
+
+    if process.returncode != 0:
+        raise ProbeError(f"ffprobe がエラー終了しました ({path}): {stderr.strip()}")
 
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise ProbeError(f"ffprobe の出力を解析できませんでした ({path}): {exc}") from exc
 

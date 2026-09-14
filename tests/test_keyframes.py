@@ -1,6 +1,6 @@
 import pytest
 
-from app.core.keyframes import can_copy, next_keyframe, prev_keyframe
+from app.core.keyframes import can_copy, nearest_keyframe, next_keyframe, prev_keyframe
 
 KEYFRAMES = [0.0, 2.0, 4.0, 6.0, 10.0]
 FPS = 30.0  # 1フレーム = 1/30秒 ≈ 0.0333秒, 許容差(0.5フレーム) ≈ 0.01667秒
@@ -69,3 +69,26 @@ class TestNextKeyframe:
 
     def test_empty_keyframes(self):
         assert next_keyframe(3.0, []) is None
+
+
+class TestNearestKeyframe:
+    def test_exact_match_returns_itself(self):
+        assert nearest_keyframe(4.0, KEYFRAMES) == 4.0
+
+    def test_closer_to_prev(self):
+        assert nearest_keyframe(2.4, KEYFRAMES) == 2.0
+
+    def test_closer_to_next(self):
+        assert nearest_keyframe(3.6, KEYFRAMES) == 4.0
+
+    def test_tie_prefers_prev(self):
+        assert nearest_keyframe(3.0, KEYFRAMES) == 2.0
+
+    def test_before_first(self):
+        assert nearest_keyframe(-5.0, KEYFRAMES) == 0.0
+
+    def test_after_last(self):
+        assert nearest_keyframe(20.0, KEYFRAMES) == 10.0
+
+    def test_empty_keyframes(self):
+        assert nearest_keyframe(3.0, []) is None

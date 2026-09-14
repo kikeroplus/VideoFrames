@@ -7,11 +7,12 @@ import os
 import subprocess
 from bisect import bisect_left, bisect_right
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.utils.paths import cache_key_for
-from app.utils.subprocess_flags import hidden_subprocess_kwargs
+from app.utils.subprocess_flags import assign_to_job, hidden_subprocess_kwargs
 
 CACHE_DIR = Path(os.environ["LOCALAPPDATA"]) / "VideoTrimmer" / "keyframes"
 
@@ -24,11 +25,17 @@ def _cache_path_for(path: Path) -> Path:
     return CACHE_DIR / f"{cache_key_for(path)}.json"
 
 
-def get_keyframes(path: Path, ffprobe_path: Path) -> list[float]:
+def get_keyframes(
+    path: Path,
+    ffprobe_path: Path,
+    set_process: Callable[[subprocess.Popen | None], None] | None = None,
+) -> list[float]:
     """動画のキーフレーム位置(秒, 昇順)を返す。結果はディスクにキャッシュする。
 
     取得に失敗した場合は KeyframeError を送出する（呼び出し側は §8.2 の通り
     「判定不能」として安全側＝再エンコードに倒すこと）。
+    set_process を渡すと、起動した Popen を呼び出し側(ワーカー)に通知する。呼び出し側は
+    これを保持しておき、不要になった際に terminate() でキャンセルできる。
     """
     cache_path = _cache_path_for(path)
     if cache_path.is_file():
@@ -38,7 +45,7 @@ def get_keyframes(path: Path, ffprobe_path: Path) -> list[float]:
         except (OSError, ValueError, TypeError):
             pass  # キャッシュ破損時は再取得する
 
-    keyframes = _probe_keyframes(path, ffprobe_path)
+    keyframes = _probe_keyframes(path, ffprobe_path, set_process=set_process)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -49,7 +56,11 @@ def get_keyframes(path: Path, ffprobe_path: Path) -> list[float]:
     return keyframes
 
 
-def _probe_keyframes(path: Path, ffprobe_path: Path) -> list[float]:
+def _probe_keyframes(
+    path: Path,
+    ffprobe_path: Path,
+    set_process: Callable[[subprocess.Popen | None], None] | None = None,
+) -> list[float]:
     cmd = [
         str(ffprobe_path),
         "-v", "error",
@@ -60,18 +71,25 @@ def _probe_keyframes(path: Path, ffprobe_path: Path) -> list[float]:
         str(path),
     ]
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8",
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
             **hidden_subprocess_kwargs(),
         )
     except OSError as exc:
         raise KeyframeError(f"ffprobe の実行に失敗しました: {exc}") from exc
 
-    if result.returncode != 0:
-        raise KeyframeError(f"ffprobe がエラー終了しました ({path}): {result.stderr.strip()}")
+    assign_to_job(process)
+    if set_process is not None:
+        set_process(process)
+    stdout, stderr = process.communicate()
+    if set_process is not None:
+        set_process(None)
+
+    if process.returncode != 0:
+        raise KeyframeError(f"ffprobe がエラー終了しました ({path}): {stderr.strip()}")
 
     keyframes: list[float] = []
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -119,6 +137,27 @@ def next_keyframe(t: float, keyframes: list[float]) -> float | None:
     return None
 
 
+def nearest_keyframe(t: float, keyframes: list[float]) -> float | None:
+    """t に最も近いキーフレームを返す(前後どちらか。無ければ None)。
+
+    IN/OUT設定を押した時点でキーフレームへ強制的に揃えるモード用。t が既に
+    キーフレーム上にある場合はそのまま t を返す(prev_keyframe/next_keyframe は
+    どちらも「厳密に前/後」を返すため、ここでは別に判定する)。
+    """
+    if not keyframes:
+        return None
+    i = bisect_left(keyframes, t)
+    if i < len(keyframes) and keyframes[i] == t:
+        return t
+    prev_kf = keyframes[i - 1] if i > 0 else None
+    next_kf = keyframes[i] if i < len(keyframes) else None
+    if prev_kf is None:
+        return next_kf
+    if next_kf is None:
+        return prev_kf
+    return prev_kf if (t - prev_kf) <= (next_kf - t) else next_kf
+
+
 class KeyframeSignals(QObject):
     loaded = Signal(Path, list)  # path, keyframes
     failed = Signal(Path, str)  # path, エラーメッセージ
@@ -132,11 +171,28 @@ class KeyframeWorker(QRunnable):
         self.path = path
         self.ffprobe_path = ffprobe_path
         self.signals = KeyframeSignals()
+        self._process: subprocess.Popen | None = None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """呼び出し側(GUIスレッド)から呼ぶ。実行中の ffprobe を直ちに終了させる。"""
+        self._cancelled = True
+        if self._process is not None:
+            try:
+                self._process.terminate()
+            except OSError:
+                pass
 
     def run(self) -> None:
+        def set_process(p: subprocess.Popen | None) -> None:
+            self._process = p
+
         try:
-            keyframes = get_keyframes(self.path, self.ffprobe_path)
+            keyframes = get_keyframes(self.path, self.ffprobe_path, set_process=set_process)
         except KeyframeError as exc:
-            self.signals.failed.emit(self.path, str(exc))
+            if not self._cancelled:
+                self.signals.failed.emit(self.path, str(exc))
+            return
+        if self._cancelled:
             return
         self.signals.loaded.emit(self.path, keyframes)

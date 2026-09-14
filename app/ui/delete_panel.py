@@ -6,11 +6,14 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QButtonGroup,
+    QCheckBox,
     QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QSpinBox,
@@ -42,10 +45,11 @@ class DeleteRequest:
     strategy: Strategy
     snapped: bool
     snapped_point: float | None  # スナップ後の実際の開始点(結果表示用)
+    overwrite: bool = False  # True の場合、出力先フォルダではなく元ファイルを上書きする
 
 
 class DeletePanel(QWidget):
-    """削除タブ。途中削除の開始/終了は抜き出しタブのIN/OUTとは独立して保持する。"""
+    """削除タブ。途中削除のIN/OUT点は抜き出しタブと共有する(PlayerPanel の状態)。"""
 
     execute_requested = Signal(object)  # DeleteRequest
 
@@ -53,9 +57,9 @@ class DeletePanel(QWidget):
         super().__init__(parent)
         self._player_panel = player_panel
         self._pending_request: DeleteRequest | None = None
-        # 途中削除用のローカル状態(抜き出しタブのIN/OUTとは別概念のため共有しない)
-        self._middle_start: float | None = None
-        self._middle_end: float | None = None
+        # このタブが表示中かどうか(タブが非表示の間は、動画プレビュー側のIN/OUT
+        # 設定を抜き出しタブが自由に使えるよう、ロックしない)。
+        self._tab_active = False
 
         self._build_ui()
         self._restore_cut_mode()
@@ -82,7 +86,7 @@ class DeletePanel(QWidget):
         layout.addWidget(QLabel("削除モード:"))
         mode_row = QHBoxLayout()
         self._mode_head_radio = QRadioButton("冒頭から")
-        self._mode_tail_radio = QRadioButton("末尾から")
+        self._mode_tail_radio = QRadioButton("末尾まで")
         self._mode_middle_radio = QRadioButton("途中を指定")
         self._mode_head_radio.setChecked(True)
         self._mode_group = QButtonGroup(self)
@@ -104,16 +108,26 @@ class DeletePanel(QWidget):
         self._length_frames_spin.setRange(1, 100_000_000)
         self._length_frames_spin.setValue(150)
         self._length_frames_spin.setSuffix(" フレーム")
+        # 埋め込みの小さい上下スピンボタンは押しづらいため隠し、代わりに
+        # 大きな +/- ボタンを外側に置く(stepUp/stepDown を呼ぶだけ)。
+        for spin in (self._length_seconds_spin, self._length_frames_spin):
+            spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self._length_stack = QStackedWidget()
         self._length_stack.addWidget(self._length_seconds_spin)
         self._length_stack.addWidget(self._length_frames_spin)
+        self._length_minus_button = QPushButton("−")
+        self._length_plus_button = QPushButton("＋")
+        for btn in (self._length_minus_button, self._length_plus_button):
+            btn.setFixedWidth(32)
         self._length_unit_seconds_radio = QRadioButton("秒")
         self._length_unit_frames_radio = QRadioButton("フレーム")
         self._length_unit_seconds_radio.setChecked(True)
         self._length_unit_group = QButtonGroup(self)
         self._length_unit_group.addButton(self._length_unit_seconds_radio)
         self._length_unit_group.addButton(self._length_unit_frames_radio)
+        length_row.addWidget(self._length_minus_button)
         length_row.addWidget(self._length_stack)
+        length_row.addWidget(self._length_plus_button)
         length_row.addWidget(self._length_unit_seconds_radio)
         length_row.addWidget(self._length_unit_frames_radio)
         length_row.addStretch(1)
@@ -127,25 +141,29 @@ class DeletePanel(QWidget):
         self._vfr_warning_label.setVisible(False)
         layout.addWidget(self._vfr_warning_label)
 
-        # 開始/終了(途中削除用)
-        start_row = QHBoxLayout()
-        start_row.addWidget(QLabel("開始:"))
-        self._start_label = QLabel("-")
-        self._start_get_button = QPushButton("現在位置を取得")
-        start_row.addWidget(self._start_label, 1)
-        start_row.addWidget(self._start_get_button)
-        layout.addLayout(start_row)
+        # IN/OUT点(途中削除用。抜き出しタブと同じ PlayerPanel の状態を共有する)
+        in_row = QHBoxLayout()
+        in_row.addWidget(QLabel("IN点:"))
+        self._in_label = QLabel("-")
+        self._in_get_button = QPushButton("現在位置を取得")
+        in_row.addWidget(self._in_label, 1)
+        in_row.addWidget(self._in_get_button)
+        layout.addLayout(in_row)
 
-        end_row = QHBoxLayout()
-        end_row.addWidget(QLabel("終了:"))
-        self._end_label = QLabel("-")
-        self._end_get_button = QPushButton("現在位置を取得")
-        end_row.addWidget(self._end_label, 1)
-        end_row.addWidget(self._end_get_button)
-        layout.addLayout(end_row)
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("OUT点:"))
+        self._out_label = QLabel("-")
+        self._out_get_button = QPushButton("現在位置を取得")
+        out_row.addWidget(self._out_label, 1)
+        out_row.addWidget(self._out_get_button)
+        layout.addLayout(out_row)
 
         self._result_label = QLabel("結果: -")
         layout.addWidget(self._result_label)
+
+        self._overwrite_checkbox = QCheckBox("元のファイルに上書きする(元に戻せません)")
+        self._overwrite_checkbox.setStyleSheet("color: firebrick;")
+        layout.addWidget(self._overwrite_checkbox)
 
         # カット方式(§8.4 共通UI)
         cut_box = QGroupBox("カット方式")
@@ -193,6 +211,8 @@ class DeletePanel(QWidget):
 
     def _connect_signals(self) -> None:
         self._player_panel.video_changed.connect(self._on_video_changed)
+        self._player_panel.in_point_changed.connect(lambda _v: self._revalidate())
+        self._player_panel.out_point_changed.connect(lambda _v: self._revalidate())
         self._player_panel.keyframes_changed.connect(self._revalidate)
 
         for rb in (self._mode_head_radio, self._mode_tail_radio, self._mode_middle_radio):
@@ -201,9 +221,13 @@ class DeletePanel(QWidget):
         self._length_unit_seconds_radio.toggled.connect(self._on_length_unit_changed)
         self._length_seconds_spin.valueChanged.connect(self._revalidate)
         self._length_frames_spin.valueChanged.connect(self._revalidate)
+        self._length_minus_button.clicked.connect(lambda: self._length_stack.currentWidget().stepDown())
+        self._length_plus_button.clicked.connect(lambda: self._length_stack.currentWidget().stepUp())
 
-        self._start_get_button.clicked.connect(self._on_get_start)
-        self._end_get_button.clicked.connect(self._on_get_end)
+        self._in_get_button.clicked.connect(self._player_panel.set_in_point)
+        self._out_get_button.clicked.connect(self._player_panel.set_out_point)
+
+        self._overwrite_checkbox.toggled.connect(self._revalidate)
 
         for rb in (self._cut_auto_radio, self._cut_copy_priority_radio, self._cut_always_encode_radio):
             rb.toggled.connect(self._revalidate)
@@ -220,8 +244,10 @@ class DeletePanel(QWidget):
         for widget in (
             self._mode_head_radio, self._mode_tail_radio, self._mode_middle_radio,
             self._length_seconds_spin, self._length_frames_spin,
+            self._length_minus_button, self._length_plus_button,
             self._length_unit_seconds_radio, self._length_unit_frames_radio,
-            self._start_get_button, self._end_get_button,
+            self._in_get_button, self._out_get_button,
+            self._overwrite_checkbox,
             self._cut_auto_radio, self._cut_copy_priority_radio, self._cut_always_encode_radio,
             self._snap_prev_button, self._snap_next_button,
             self._execute_button,
@@ -231,20 +257,57 @@ class DeletePanel(QWidget):
             self._revalidate()
 
     def _on_video_changed(self) -> None:
-        self._middle_start = None
-        self._middle_end = None
-        self._update_start_end_labels()
+        self._apply_fixed_endpoint()
         self._revalidate()
 
     def _on_mode_changed(self) -> None:
         is_middle = self._mode_middle_radio.isChecked()
         self._length_stack.setEnabled(not is_middle)
+        self._length_minus_button.setEnabled(not is_middle)
+        self._length_plus_button.setEnabled(not is_middle)
         self._length_unit_seconds_radio.setEnabled(not is_middle)
         self._length_unit_frames_radio.setEnabled(not is_middle)
-        self._start_get_button.setEnabled(is_middle)
-        self._end_get_button.setEnabled(is_middle)
+        # 冒頭からモードではIN点(常に0固定)、末尾までモードではOUT点(常に動画末尾固定)
+        # だけをグレーアウトする。もう一方は途中を指定モードと同様に操作可能なままにする。
+        mode = self._get_mode()
+        self._in_label.setEnabled(mode != "head")
+        self._in_get_button.setEnabled(mode != "head")
+        self._out_label.setEnabled(mode != "tail")
+        self._out_get_button.setEnabled(mode != "tail")
         self._update_vfr_warning()
+        self._apply_fixed_endpoint()
+        self._apply_lock_state()
         self._revalidate()
+
+    def set_tab_active(self, active: bool) -> None:
+        """削除タブが表示中かどうかをメインウィンドウから受け取る。
+
+        非表示の間は動画プレビュー側のIN/OUT設定をロックしない
+        (抜き出しタブで自由にIN/OUTを使えるようにするため)。
+        """
+        self._tab_active = active
+        self._apply_lock_state()
+
+    def _apply_lock_state(self) -> None:
+        """このタブが表示中の間、モードに応じて動画プレビュー側の「IN設定」/「OUT設定」
+        ボタンをグレーアウトする。冒頭からモードはIN設定のみ、末尾までモードはOUT設定のみ
+        をロックし、もう一方は操作可能なままにする。"""
+        mode = self._get_mode()
+        self._player_panel.set_in_point_locked(self._tab_active and mode == "head")
+        self._player_panel.set_out_point_locked(self._tab_active and mode == "tail")
+
+    def _apply_fixed_endpoint(self) -> None:
+        """冒頭からモードではIN点を動画先頭(0)に、末尾までモードではOUT点を
+        動画末尾に固定する(抜き出しタブと共有のIN/OUTを、このモードでは
+        ユーザーが動かす必要がないため自動的に合わせておく)。"""
+        item = self._player_panel.current_item
+        if item is None:
+            return
+        mode = self._get_mode()
+        if mode == "head":
+            self._player_panel.set_in_point_value(0.0)
+        elif mode == "tail":
+            self._player_panel.set_out_point_value(item.duration)
 
     def _on_length_unit_changed(self) -> None:
         item = self._player_panel.current_item
@@ -298,28 +361,6 @@ class DeletePanel(QWidget):
             return "tail"
         return "middle"
 
-    def _on_get_start(self) -> None:
-        if self._player_panel.current_item is None:
-            return
-        self._middle_start = self._player_panel.current_position_seconds()
-        self._update_start_end_labels()
-        self._revalidate()
-
-    def _on_get_end(self) -> None:
-        if self._player_panel.current_item is None:
-            return
-        self._middle_end = self._player_panel.current_position_seconds()
-        self._update_start_end_labels()
-        self._revalidate()
-
-    def _update_start_end_labels(self) -> None:
-        self._start_label.setText(
-            seconds_to_timecode(self._middle_start) if self._middle_start is not None else "-"
-        )
-        self._end_label.setText(
-            seconds_to_timecode(self._middle_end) if self._middle_end is not None else "-"
-        )
-
     def _current_decision_start(self) -> float | None:
         """§8.3 の判定表に基づく、このモードでコピー可否を左右する開始点。"""
         mode = self._get_mode()
@@ -328,7 +369,7 @@ class DeletePanel(QWidget):
             return n if n > 0 else None
         if mode == "tail":
             return 0.0
-        return self._middle_end  # middle
+        return self._player_panel.out_point  # middle
 
     def _apply_snap(self, finder) -> None:
         item = self._player_panel.current_item
@@ -344,9 +385,7 @@ class DeletePanel(QWidget):
         if mode == "head":
             self._set_length_seconds(target)
         elif mode == "middle":
-            self._middle_end = target
-            self._update_start_end_labels()
-            self._player_panel.seek_to(target)
+            self._player_panel.set_out_point_value(target)
         self._revalidate()
 
     # ------------------------------------------------------------- 検証
@@ -364,6 +403,11 @@ class DeletePanel(QWidget):
     def _revalidate(self) -> None:
         item = self._player_panel.current_item
         self._reason_label.setText("")
+
+        in_s = self._player_panel.in_point
+        out_s = self._player_panel.out_point
+        self._in_label.setText(seconds_to_timecode(in_s) if in_s is not None else "-")
+        self._out_label.setText(seconds_to_timecode(out_s) if out_s is not None else "-")
 
         if item is None:
             self._invalid("動画を選択してください。")
@@ -387,13 +431,14 @@ class DeletePanel(QWidget):
                 return
             decision_start = n if mode == "head" else 0.0
         else:
-            a, b = self._middle_start, self._middle_end
+            a, b = in_s, out_s
             if a is None or b is None:
-                self._invalid("開始と終了の両方を設定してください(「現在位置を取得」)。")
+                self._invalid("IN点とOUT点の両方を設定してください(「現在位置を取得」)。")
                 self._clear_cut_status()
                 return
-            if not (0.0 < a < b < duration):
-                self._invalid("開始と終了は「0 < 開始 < 終了 < 動画長」を満たす必要があります。")
+            # 途中削除は冒頭(IN=0)や末尾(OUT=動画長)ぎりぎりまで許容する。
+            if not (0.0 <= a < b <= duration):
+                self._invalid("IN点とOUT点は「0 ≦ IN点 < OUT点 ≦ 動画長」を満たす必要があります。")
                 self._clear_cut_status()
                 return
             decision_start = b
@@ -422,7 +467,16 @@ class DeletePanel(QWidget):
                 )
                 self._clear_cut_status()
                 return
-            final_ranges = residual_ranges_middle(a, decision.start, duration)
+            # IN=0(冒頭)や OUT=動画長(末尾)ぎりぎりの場合、片側の残存区間が
+            # 長さ0になる。これは「冒頭から」/「末尾まで」と等価な結果なので
+            # 実行時の区間には含めない(main_window 側は区間数で単発/2区間を判定する)。
+            final_ranges = [
+                r for r in residual_ranges_middle(a, decision.start, duration) if r[1] - r[0] > 1e-6
+            ]
+            if not final_ranges:
+                self._invalid("動画全体が削除対象になるため実行できません。")
+                self._clear_cut_status()
+                return
 
         text, show_prev, show_next = format_cut_status(
             decision, cut_mode, state, can_snap=(mode != "tail"),
@@ -437,6 +491,7 @@ class DeletePanel(QWidget):
         self._pending_request = DeleteRequest(
             mode=mode, ranges=final_ranges, strategy=decision.strategy,
             snapped=decision.snapped, snapped_point=decision.start if decision.snapped else None,
+            overwrite=self._overwrite_checkbox.isChecked(),
         )
 
     def _update_result_label(self, ranges: list[tuple[float, float]], duration: float) -> None:
@@ -450,8 +505,18 @@ class DeletePanel(QWidget):
     # --------------------------------------------------------------- 実行
 
     def _on_execute_clicked(self) -> None:
-        if self._pending_request is not None:
-            self.execute_requested.emit(self._pending_request)
+        if self._pending_request is None:
+            return
+        if self._pending_request.overwrite:
+            reply = QMessageBox.question(
+                self, "元のファイルを上書き",
+                "元の動画ファイルを上書きします。この操作は元に戻せません。実行しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self.execute_requested.emit(self._pending_request)
 
     def trigger_execute(self) -> None:
         """Enterキー等、外部からの実行トリガー用。ボタンが有効な場合のみ実行する。"""

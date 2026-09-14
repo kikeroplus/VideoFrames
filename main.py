@@ -20,6 +20,11 @@ def run_gui() -> int:
 
     from app.ui.main_window import MainWindow
     from app.utils.paths import resource_path
+    from app.utils.subprocess_flags import ensure_child_process_job
+
+    # アプリが強制終了・クラッシュしても ffmpeg/ffprobe の子プロセスが孤児化して
+    # ディスクアクセスを続けないよう、専用の Job Object にまとめておく(保険)。
+    ensure_child_process_job()
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(str(resource_path("assets/icon.ico"))))

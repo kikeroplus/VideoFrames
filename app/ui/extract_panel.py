@@ -38,12 +38,15 @@ class ExtractRequest:
 class ExtractPanel(QWidget):
     """抜き出しタブ。IN/OUT自体は PlayerPanel が保持する値を共有して使う。"""
 
-    execute_requested = Signal(object)  # ExtractRequest
+    execute_requested = Signal(object)  # ExtractRequest | None (Noneは登録リスト使用時)
 
     def __init__(self, player_panel: PlayerPanel, parent=None):
         super().__init__(parent)
         self._player_panel = player_panel
         self._pending_request: ExtractRequest | None = None
+        # 抜き出しポイントリストに登録があるか(main_window から通知される)。
+        # 登録があれば、現在のIN/OUTが未設定でも実行ボタンを有効にする。
+        self._has_registered_points = False
 
         self._build_ui()
         self._restore_cut_mode()
@@ -298,6 +301,19 @@ class ExtractPanel(QWidget):
             self._snap_next_button.setVisible(False)
             return
 
+        if self._has_registered_points:
+            # 現在のIN/OUTの状態(未設定・片方だけ設定済み等)に関わらず、抜き出し
+            # ポイントリストに登録があればそちらを使って実行できる
+            # (main_window 側が実行時にリストを優先するため、以降の現在値の
+            # 検証はスキップしてよい)。
+            self._reason_label.setText("")
+            self._cut_status_label.setText("登録済みの抜き出しポイント一覧を使って実行します。")
+            self._snap_prev_button.setVisible(False)
+            self._snap_next_button.setVisible(False)
+            self._execute_button.setEnabled(True)
+            self._pending_request = None
+            return
+
         if in_s is None:
             self._invalid("IN点を設定してください(Iキーまたは「現在位置を取得」)。")
             self._cut_status_label.setText("")
@@ -363,9 +379,32 @@ class ExtractPanel(QWidget):
 
     # --------------------------------------------------------------- 実行
 
+    def current_request(self) -> ExtractRequest | None:
+        """現在有効なIN/OUT設定に基づくリクエストを返す(登録リストへの追加用)。
+
+        IN/OUT未設定やキーフレーム判定中など、実行できない状態では None を返す。
+        """
+        return self._pending_request
+
+    def set_exclude_audio(self, exclude: bool) -> None:
+        """抜き出しポイントリストからの呼び出し用: 「音声を含めない」の状態を復元する。"""
+        self._exclude_audio_checkbox.setChecked(exclude)
+
+    def set_has_registered_points(self, has_points: bool) -> None:
+        """main_window から、抜き出しポイントリストに登録があるかどうかを通知する。
+
+        登録があれば、現在のIN/OUTが未設定でも一覧を使って実行できるようにする。
+        """
+        self._has_registered_points = has_points
+        self._revalidate()
+
     def _on_execute_clicked(self) -> None:
         if self._pending_request is not None:
             self.execute_requested.emit(self._pending_request)
+        elif self._has_registered_points:
+            # 現在のIN/OUTは無効だが、リストの登録分で実行する
+            # (main_window 側はリストが非空ならこの値を使わない)。
+            self.execute_requested.emit(None)
 
     def trigger_execute(self) -> None:
         """Enterキー等、外部からの実行トリガー用。ボタンが有効な場合のみ実行する。"""

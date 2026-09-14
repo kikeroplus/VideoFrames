@@ -11,7 +11,7 @@ from typing import Callable
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.core.edit_ops import Strategy, build_cut_cmd
-from app.utils.subprocess_flags import hidden_subprocess_kwargs
+from app.utils.subprocess_flags import assign_to_job, hidden_subprocess_kwargs
 
 # app/core/ffmpeg_runner.py から見てプロジェクトルート（VideoTrimmer/ 相当）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -82,6 +82,7 @@ def _run_ffmpeg(
     except OSError as exc:
         return False, f"ffmpeg の起動に失敗しました: {exc}"
 
+    assign_to_job(process)
     set_process(process)
     log_lines: list[str] = []
     assert process.stdout is not None
@@ -191,6 +192,7 @@ class DeleteMiddleJob(QRunnable):
         strategy: Strategy,
         vcodec: str,
         has_audio: bool,
+        exclude_audio: bool = False,
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -200,6 +202,7 @@ class DeleteMiddleJob(QRunnable):
         self.strategy = strategy
         self.vcodec = vcodec
         self.has_audio = has_audio
+        self.exclude_audio = exclude_audio
         self.signals = FFmpegSignals()
         self._process: subprocess.Popen | None = None
         self._cancel_requested = False
@@ -236,6 +239,7 @@ class DeleteMiddleJob(QRunnable):
                     self.ffmpeg_path, self.src, segment_path,
                     start=start, end=end, strategy=self.strategy,
                     vcodec=self.vcodec, has_audio=self.has_audio,
+                    exclude_audio=self.exclude_audio,
                 )
                 segment_weight = (range_durations[i] / total_range_duration) * CUT_WEIGHT
                 base = progress_so_far
