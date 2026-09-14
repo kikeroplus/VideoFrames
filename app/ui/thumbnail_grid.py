@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QIcon, QPixmap, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import QListView
+from PySide6.QtGui import QIcon, QPainter, QPen, QPixmap, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import QListView, QStyle, QStyledItemDelegate
 
 from app.core.models import VideoItem
 
@@ -32,6 +32,28 @@ def _solid_pixmap(size: int, color: Qt.GlobalColor) -> QPixmap:
     return pixmap
 
 
+class _SelectionBorderDelegate(QStyledItemDelegate):
+    """選択中の項目にアクセントカラーの枠を描画する。
+
+    IconMode の標準の選択ハイライトはテーマによっては非常に薄く、どれが現在
+    選択中の動画か分かりづらいため、明示的な枠で強調する。
+    """
+
+    _BORDER_WIDTH = 3
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        super().paint(painter, option, index)
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.save()
+            pen = QPen(option.palette.highlight().color())
+            pen.setWidth(self._BORDER_WIDTH)
+            painter.setPen(pen)
+            half = self._BORDER_WIDTH // 2 + 1
+            rect = option.rect.adjusted(half, half, -half, -half)
+            painter.drawRoundedRect(rect, 4, 4)
+            painter.restore()
+
+
 class ThumbnailGrid(QListView):
     """動画のサムネイル一覧。選択されると video_selected(path) を発行する。"""
 
@@ -41,6 +63,7 @@ class ThumbnailGrid(QListView):
         super().__init__(parent)
         self._model = QStandardItemModel(self)
         self.setModel(self._model)
+        self.setItemDelegate(_SelectionBorderDelegate(self))
         self.setViewMode(QListView.ViewMode.IconMode)
         # 常に1列固定で縦に並べる(ウィンドウ幅が変わっても列数は変化させない)。
         self.setFlow(QListView.Flow.TopToBottom)
