@@ -374,10 +374,10 @@ class PlayerPanel(QWidget):
         if self._force_keyframe_checkbox.isChecked() and self._keyframes:
             snapped = nearest_keyframe(position_s, self._keyframes)
             if snapped is not None:
-                # キーフレーム位置まで実際にシークしてサムネも取り直す
-                # (見た目の再生位置とIN点の値を一致させる)。
-                self.set_in_point_value(snapped)
-                return
+                position_s = snapped
+        # set_in_point_value() のように一時停止・シークはしない(再生中に押しても
+        # 再生が止まらないようにするため)。サムネは現在表示中のライブフレームを
+        # そのまま使う(キーフレーム位置ぴったりではなく近似になる)。
         self._in_point_s = position_s
         self._update_in_out_label()
         self._set_thumb(self._in_thumb_label)
@@ -465,8 +465,10 @@ class PlayerPanel(QWidget):
         if self._force_keyframe_checkbox.isChecked() and self._keyframes:
             snapped = nearest_keyframe(position_s, self._keyframes)
             if snapped is not None:
-                self.set_out_point_value(snapped)
-                return
+                position_s = snapped
+        # set_out_point_value() のように一時停止・シークはしない(再生中に押しても
+        # 再生が止まらないようにするため)。サムネは現在表示中のライブフレームを
+        # そのまま使う(キーフレーム位置ぴったりではなく近似になる)。
         self._out_point_s = position_s
         self._update_in_out_label()
         self._set_thumb(self._out_thumb_label)
