@@ -211,8 +211,8 @@ class DeletePanel(QWidget):
 
     def _connect_signals(self) -> None:
         self._player_panel.video_changed.connect(self._on_video_changed)
-        self._player_panel.in_point_changed.connect(lambda _v: self._revalidate())
-        self._player_panel.out_point_changed.connect(lambda _v: self._revalidate())
+        self._player_panel.in_point_changed.connect(self._on_in_point_changed)
+        self._player_panel.out_point_changed.connect(self._on_out_point_changed)
         self._player_panel.keyframes_changed.connect(self._revalidate)
 
         for rb in (self._mode_head_radio, self._mode_tail_radio, self._mode_middle_radio):
@@ -258,6 +258,19 @@ class DeletePanel(QWidget):
 
     def _on_video_changed(self) -> None:
         self._apply_fixed_endpoint()
+        self._revalidate()
+
+    def _on_in_point_changed(self, value: float | None) -> None:
+        """「末尾まで」モードでIN設定を押した際、(動画長-IN点)を「長さ」欄に反映する。"""
+        item = self._player_panel.current_item
+        if value is not None and item is not None and self._get_mode() == "tail":
+            self._set_length_seconds(max(0.0, item.duration - value))
+        self._revalidate()
+
+    def _on_out_point_changed(self, value: float | None) -> None:
+        """「冒頭から」モードでOUT設定を押した際、OUT点の値を「長さ」欄に反映する。"""
+        if value is not None and self._get_mode() == "head":
+            self._set_length_seconds(value)
         self._revalidate()
 
     def _on_mode_changed(self) -> None:
