@@ -81,6 +81,18 @@ class ThumbnailGrid(QListView):
         item.setEditable(False)
         self._model.appendRow(item)
 
+    def set_loading(self, path: Path) -> None:
+        """既存項目を「読み込み中」表示に戻す(上書き保存後の1本だけ再読込用)。
+
+        該当項目が無い場合は何もしない。
+        """
+        item = self._find_item(path)
+        if item is None:
+            return
+        item.setIcon(QIcon(_solid_pixmap(self._thumb_size, Qt.GlobalColor.gray)))
+        item.setText(f"{path.name}\n読み込み中…")
+        item.setData("loading", STATUS_ROLE)
+
     def _find_item(self, path: Path) -> QStandardItem | None:
         for row in range(self._model.rowCount()):
             item = self._model.item(row)

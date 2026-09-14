@@ -404,6 +404,27 @@ class MainWindow(QMainWindow):
             self._active_workers.append(worker)
             self._pool.start(worker)
 
+    def _reload_single_video(self, path: Path) -> None:
+        """上書き保存後など、変更のあった動画1本だけを再読み込みする。
+
+        以前は _open_folder() でフォルダ全体を再スキャンしていたが、これだと
+        上書きした1本のためにフォルダ内の全動画へ ffprobe/ffmpeg が再実行され、
+        大量のディスクアクセスが発生してしまっていた(動画本数が多いフォルダでは
+        ディスク使用率が高止まりし続け、アプリが操作しづらくなるほどだった)。
+        変更があった動画だけを対象にすることでこれを避ける。
+        """
+        if self._ffmpeg_path is None or self._ffprobe_path is None:
+            return
+        self._grid.set_loading(path)
+        if self._current_video_path == path:
+            self._player_panel.show_loading(path)
+            self._pending_project_video_select = path
+        worker = LoadVideoWorker(path, self._generation, self._ffmpeg_path, self._ffprobe_path)
+        worker.signals.loaded.connect(self._on_video_loaded)
+        worker.signals.failed.connect(self._on_video_failed)
+        self._active_workers.append(worker)
+        self._pool.start(worker)
+
     # --------------------------------------------------------------- 読込
 
     def _on_video_loaded(self, generation: int, path: Path, item: VideoItem) -> None:
@@ -802,8 +823,10 @@ class MainWindow(QMainWindow):
         パスを、失敗時は一時ファイルのパスを返す(呼び出し側はこれを最終的な結果として扱う)。
 
         置き換え前にプレイヤーを解放しておく必要がある(元ファイルを再生中のまま
-        だとロックされて置き換えに失敗する場合がある)。置き換え後はフォルダを
-        再読込みし、サムネイル・メタ情報を新しい内容に合わせて更新する。
+        だとロックされて置き換えに失敗する場合がある)。置き換え後は変更のあった
+        動画1本だけを再読込みし、サムネイル・メタ情報を新しい内容に合わせて更新する
+        (フォルダ全体を再読込みすると他の動画すべてに ffprobe/ffmpeg が再実行され、
+        ディスクアクセスが止まらなくなるため)。
         """
         if self._player_panel.current_item is not None and self._player_panel.current_item.path == target:
             self._player_panel.clear()
@@ -817,14 +840,13 @@ class MainWindow(QMainWindow):
             )
             return tmp_path
 
+        # 上書きにより内容が変わったため、この動画に紐づく抜き出しポイントは無効化する。
+        self._extract_points_by_video.pop(target, None)
+        if self._current_video_path == target:
+            self._extract_points_panel.clear()
+
         if self._current_folder is not None and target.parent == self._current_folder:
-            # _open_folder は抜き出しポイントの保持マップを全消去するため、他の動画分は
-            # 退避してから復元する(上書きした動画自体の分は内容が変わって無効なため捨てる)。
-            self._save_extract_points_for(self._current_video_path)
-            preserved_points = dict(self._extract_points_by_video)
-            preserved_points.pop(target, None)
-            self._open_folder(self._current_folder)
-            self._extract_points_by_video = preserved_points
+            self._reload_single_video(target)
         return target
 
     def _show_toast(self, message: str, action_text: str | None = None, on_action=None) -> None:
